@@ -1,23 +1,18 @@
-import { useEffect, useMemo, useState } from "react";
+import { useState } from "react";
+import { api } from "../api";
 
 const COLORS = ["var(--accent2)", "var(--teal)", "var(--gold)", "var(--coral)", "#a78bfa", "#34d399"];
 
-export default function VendorBudget({ eventData, aiResults, setAiResults, expenses, setExpenses, vendors, setVendors, bookings, setBookings }) {
+export default function VendorBudget({ eventData, aiResults, expenses, setExpenses, vendors, setVendors, bookings, setBookings }) {
   const [expForm, setExpForm] = useState({ category: "", description: "", amount: "" });
-  
-  // New features state
   const [search, setSearch] = useState("");
   const [filterCat, setFilterCat] = useState("All Categories");
   const [filterLocation, setFilterLocation] = useState("");
   const [filterMaxBudget, setFilterMaxBudget] = useState("");
   const [compareList, setCompareList] = useState([]);
   const [isTagging, setIsTagging] = useState(false);
-  const [selectedMapVendor, setSelectedMapVendor] = useState(null);
-  const [marketVendors, setMarketVendors] = useState([]);
-  const [isLoadingMarket, setIsLoadingMarket] = useState(false);
-  const [marketError, setMarketError] = useState("");
 
-  const requestBooking = (vendor) => {
+  const requestBooking = async (vendor) => {
     if (!eventData) return alert("Please create an event first.");
     const eventId = eventData.id || "evt-1";
     const exists = bookings.find(b => b.vendorId === vendor.id && b.eventId === eventId);
@@ -27,53 +22,35 @@ export default function VendorBudget({ eventData, aiResults, setAiResults, expen
       eventName: eventData.name, date: eventData.date,
       budget: Number(eventData.budgetMax), status: "Pending"
     };
-    setBookings(b => [...b, booking]);
-    alert("Booking Request Sent!");
-
-    // Sync to Notion non-blocking
-    fetch("/api/notion/save-booking", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        eventName: eventData.name,
-        vendorName: vendor.organization,
-        date: eventData.date,
-        budget: Number(eventData.budgetMax),
-        status: "Pending",
-      }),
-    }).then(r => r.ok && console.log("Notion: booking saved"))
-      .catch(e => console.warn("Notion booking sync failed:", e.message));
+    try {
+      const saved = await api.createBooking(booking);
+      setBookings(b => [...b, saved]);
+      alert("Booking Request Sent!");
+      fetch("/api/notion/save-booking", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          eventName: eventData.name,
+          vendorName: vendor.organization,
+          date: eventData.date,
+          budget: Number(eventData.budgetMax),
+          status: "Pending",
+        }),
+      }).catch(e => console.warn("Notion booking sync failed:", e.message));
+    } catch (err) {
+      console.error(err);
+      alert("Failed to create booking.");
+    }
   };
 
   const autoTagVendors = async () => {
-    if (marketVendors.length === 0) return;
+    if (vendors.length === 0) return;
     setIsTagging(true);
     try {
-      const payload = marketVendors.map(v => ({
-        id: v.id,
-        category: v.category,
-        organization: v.organization,
-        rating: v.rating,
-        priceLevel: v.priceLevel,
-        services: v.services,
-        address: v.address,
-        location: v.location,
-        priceMin: v.priceMin,
-        priceMax: v.priceMax,
-      }));
-      const response = await fetch("/api/tag-vendors", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ vendors: payload })
-      });
-      if (!response.ok) throw new Error("Tagging API failed");
-      const parsed = await response.json();
-      setMarketVendors(prev => prev.map(v => {
-        const tag = parsed?.[v.id];
-        if (!tag) return v;
-        if (typeof tag === "string") return { ...v, aiTag: tag };
-        return { ...v, aiTag: `${tag.segment} • ${tag.quality}`, aiTagReason: tag.reason };
-      }));
+      const payload = vendors.map(v => ({ id: v.id, category: v.category, min: v.priceMin, max: v.priceMax }));
+      await api.tagVendors(payload);
+      const updated = await api.getVendors();
+      setVendors(updated);
     } catch (err) {
       console.error(err);
       alert("AI Tagging failed");
@@ -82,36 +59,7 @@ export default function VendorBudget({ eventData, aiResults, setAiResults, expen
     }
   };
 
-  const effectiveLocation = (filterLocation || eventData?.location || "").trim();
-
-  useEffect(() => {
-    const loc = effectiveLocation;
-    let ignore = false;
-    setIsLoadingMarket(true);
-    setMarketError("");
-    const qs = new URLSearchParams();
-    if (loc) qs.set("location", loc);
-    if (filterCat && filterCat !== "All Categories") qs.set("category", filterCat);
-    if (search) qs.set("q", search);
-    qs.set("limit", "60");
-    fetch(`/api/notion/vendors?${qs.toString()}`)
-      .then(r => r.json())
-      .then(d => {
-        if (ignore) return;
-        const list = Array.isArray(d?.vendors) ? d.vendors : [];
-        setMarketVendors(list);
-        if (!list.length) setMarketError("No vendors found in Notion yet. Switch to Vendor role and save a profile.");
-      })
-      .catch(() => {
-        if (ignore) return;
-        setMarketError("Could not load vendors from Notion.");
-        setMarketVendors([]);
-      })
-      .finally(() => !ignore && setIsLoadingMarket(false));
-    return () => { ignore = true; };
-  }, [effectiveLocation, filterCat, search]);
-
-  const filteredVendors = (marketVendors || []).filter(v => {
+  const filteredVendors = (vendors || []).filter(v => {
     const matchSearch = (v.organization || "").toLowerCase().includes(search.toLowerCase());
     const matchCat = filterCat === "All Categories" || v.category === filterCat;
     const matchLoc = !filterLocation || (v.location || "").toLowerCase().includes(filterLocation.toLowerCase());
@@ -128,51 +76,21 @@ export default function VendorBudget({ eventData, aiResults, setAiResults, expen
     }
   };
 
-
-  // NOTE: We no longer early-return when eventData is missing — the Browse Vendors
-  // section must always be visible so users can discover vendor profiles.
-  // Only the budget/AI sections are gated on eventData.
-
-  const addExpense = () => {
+  const addExpense = async () => {
     if (!expForm.category || !expForm.amount) return;
-    setExpenses(e => [...e, { ...expForm, id: Date.now(), amount: Number(expForm.amount) }]);
-    setExpForm({ category: "", description: "", amount: "" });
+    try {
+      const saved = await api.addExpense({ ...expForm, amount: Number(expForm.amount) });
+      setExpenses(e => [...e, saved]);
+      setExpForm({ category: "", description: "", amount: "" });
+    } catch (err) {
+      console.error(err);
+      alert("Failed to add expense.");
+    }
   };
 
   const totalSpent = expenses.reduce((s, e) => s + e.amount, 0);
   const budget = aiResults?.budget?.total || Number(eventData?.budgetMax) || 0;
   const utilPct = budget ? Math.min(100, Math.round((totalSpent / budget) * 100)) : 0;
-  const quickBestWithinBudget = (aiResults?.budget?.breakdown || [])
-    .filter(item => Number(item.amount) > 0)
-    .slice(0, 3)
-    .map(item => ({ category: item.category, amount: Number(item.amount) }));
-  const mapCandidates = useMemo(
-    () => (aiResults?.vendors || []).filter(v => Number.isFinite(Number(v.lat)) && Number.isFinite(Number(v.lon))),
-    [aiResults?.vendors]
-  );
-
-  useEffect(() => {
-    if (!mapCandidates.length) {
-      setSelectedMapVendor(null);
-      return;
-    }
-    setSelectedMapVendor(prev => {
-      if (prev && mapCandidates.some(v => v.name === prev.name)) return prev;
-      return mapCandidates[0];
-    });
-  }, [mapCandidates]);
-
-  const getEmbedUrl = (vendor) => {
-    if (!vendor) return null;
-    const lat = Number(vendor.lat);
-    const lon = Number(vendor.lon);
-    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
-    const left = lon - 0.02;
-    const right = lon + 0.02;
-    const top = lat + 0.02;
-    const bottom = lat - 0.02;
-    return `https://www.openstreetmap.org/export/embed.html?bbox=${left}%2C${bottom}%2C${right}%2C${top}&layer=mapnik&marker=${lat}%2C${lon}`;
-  };
 
   return (
     <div>
@@ -212,68 +130,12 @@ export default function VendorBudget({ eventData, aiResults, setAiResults, expen
         </div>
       </div>
       )}
-      {eventData && aiResults?.estimatedCost && (
-        <div className="card mb-3" style={{ borderColor: "rgba(61,207,176,0.2)" }}>
-          <div style={{ fontSize: "12px", fontFamily: "DM Mono", color: "var(--text3)", textTransform: "uppercase", marginBottom: "0.75rem" }}>
-            Location-based estimated event cost
-          </div>
-          <div className="grid-3" style={{ gap: "1rem" }}>
-            <div>
-              <div style={{ fontSize: "12px", color: "var(--text3)" }}>Location</div>
-              <div style={{ fontSize: "15px", color: "var(--text)", fontWeight: 500 }}>{aiResults.estimatedCost.location || eventData.location || "India"}</div>
-            </div>
-            <div>
-              <div style={{ fontSize: "12px", color: "var(--text3)" }}>Estimated Minimum</div>
-              <div style={{ fontSize: "15px", color: "var(--teal)", fontWeight: 500 }}>₹{Number(aiResults.estimatedCost.estimatedMin || 0).toLocaleString()}</div>
-            </div>
-            <div>
-              <div style={{ fontSize: "12px", color: "var(--text3)" }}>Estimated Maximum</div>
-              <div style={{ fontSize: "15px", color: "var(--gold)", fontWeight: 500 }}>₹{Number(aiResults.estimatedCost.estimatedMax || 0).toLocaleString()}</div>
-            </div>
-          </div>
-          {aiResults.estimatedCost.note && (
-            <div style={{ marginTop: "0.75rem", fontSize: "12px", color: "var(--text3)" }}>{aiResults.estimatedCost.note}</div>
-          )}
-        </div>
-      )}
-      {eventData && aiResults?.budgetAdvice && !aiResults.budgetAdvice.withinBudget && (
-        <div className="card mb-3" style={{ borderColor: "rgba(255,107,107,0.35)", background: "rgba(255,107,107,0.06)" }}>
-          <div style={{ fontSize: "12px", fontFamily: "DM Mono", color: "var(--coral)", textTransform: "uppercase", marginBottom: "0.75rem" }}>
-            Budget advisory
-          </div>
-          <div style={{ fontSize: "14px", color: "var(--text)", marginBottom: "0.5rem" }}>
-            {aiResults.budgetAdvice.message}
-          </div>
-          <div className="grid-3" style={{ gap: "0.75rem" }}>
-            <div>
-              <div style={{ fontSize: "12px", color: "var(--text3)" }}>Current Budget</div>
-              <div style={{ fontSize: "14px", color: "var(--text)" }}>₹{Number(budget).toLocaleString()}</div>
-            </div>
-            <div>
-              <div style={{ fontSize: "12px", color: "var(--text3)" }}>Suggested Minimum</div>
-              <div style={{ fontSize: "14px", color: "var(--gold)" }}>₹{Number(aiResults.budgetAdvice.suggestedBudget || 0).toLocaleString()}</div>
-            </div>
-            <div>
-              <div style={{ fontSize: "12px", color: "var(--text3)" }}>Gap</div>
-              <div style={{ fontSize: "14px", color: "var(--coral)" }}>₹{Number(aiResults.budgetAdvice.overBy || 0).toLocaleString()}</div>
-            </div>
-          </div>
-          {quickBestWithinBudget.length > 0 && (
-            <div style={{ marginTop: "0.75rem", fontSize: "12px", color: "var(--text2)" }}>
-              Best possible within your current budget:
-              {" "}
-              {quickBestWithinBudget.map(item => `${item.category} ~ ₹${item.amount.toLocaleString()}`).join(" • ")}
-            </div>
-          )}
-        </div>
-      )}
 
       {eventData && (
       <div className="grid-2" style={{ gap: "1.5rem" }}>
-        {/* Suggested Vendors (AI) */}
         <div>
           <div style={{ fontSize: "14px", fontWeight: 500, marginBottom: "1rem", color: "var(--text)" }}>Suggested vendors</div>
-          {Array.isArray(aiResults?.vendors) && aiResults.vendors.length > 0 ? (
+          {aiResults?.vendors ? (
             <div style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>
               {aiResults.vendors.map((v, i) => (
                 <div key={i} className="card" style={{ padding: "1rem", borderLeft: `3px solid ${COLORS[i % COLORS.length]}` }}>
@@ -283,54 +145,19 @@ export default function VendorBudget({ eventData, aiResults, setAiResults, expen
                   </div>
                   <div style={{ fontSize: "15px", fontWeight: 500, color: "var(--text)", marginBottom: "4px" }}>{v.name}</div>
                   <div className="flex justify-between">
-                    <span style={{ fontSize: "13px", color: v.priceSource === "notion" ? "var(--teal)" : "var(--gold)" }}>
-                      {v.priceRange}
-                    </span>
+                    <span style={{ fontSize: "13px", color: "var(--teal)" }}>{v.priceRange}</span>
                     <span style={{ fontSize: "12px", color: "var(--text3)" }}>{v.notes}</span>
                   </div>
-                  {v.priceSource === "notion" ? (
-                    <div style={{ marginTop: "8px" }}>
-                      <span className="badge badge-teal" style={{ fontSize: "10px" }}>Verified price (Notion)</span>
-                    </div>
-                  ) : (
-                    <div style={{ marginTop: "8px" }}>
-                      <span className="badge badge-gold" style={{ fontSize: "10px" }}>Price not listed — request quote</span>
-                    </div>
-                  )}
-                  {(Number.isFinite(Number(v.lat)) && Number.isFinite(Number(v.lon))) && (
-                    <div className="vendor-map-actions">
-                      <button
-                        className="btn btn-outline btn-sm"
-                        onClick={() => setSelectedMapVendor(v)}
-                      >
-                        View on map
-                      </button>
-                      {v.mapUrl && (
-                        <a
-                          href={v.mapUrl}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="btn btn-sm"
-                          style={{ textDecoration: "none", border: "1px solid var(--border2)", color: "var(--text2)", background: "transparent" }}
-                        >
-                          Open map
-                        </a>
-                      )}
-                    </div>
-                  )}
                 </div>
               ))}
             </div>
           ) : (
             <div className="card" style={{ borderStyle: "dashed", textAlign: "center", padding: "2rem" }}>
-              <div style={{ color: "var(--text3)", fontSize: "13px" }}>
-                No live vendors found for this location yet. Try nearby city names or configure `GOOGLE_PLACES_API_KEY`.
-              </div>
+              <div style={{ color: "var(--text3)", fontSize: "13px" }}>Generate AI plan to see vendor suggestions</div>
             </div>
           )}
         </div>
 
-        {/* Budget */}
         <div>
           <div style={{ fontSize: "14px", fontWeight: 500, marginBottom: "1rem", color: "var(--text)" }}>Budget allocation</div>
           {aiResults?.budget?.breakdown ? (
@@ -353,7 +180,6 @@ export default function VendorBudget({ eventData, aiResults, setAiResults, expen
             </div>
           )}
 
-          {/* Expense tracker */}
           <div style={{ fontSize: "14px", fontWeight: 500, margin: "1.25rem 0 0.75rem", color: "var(--text)" }}>Track expenses</div>
           <div className="card" style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>
             <div className="grid-2">
@@ -380,7 +206,14 @@ export default function VendorBudget({ eventData, aiResults, setAiResults, expen
                       <td><span className="badge badge-accent">{ex.category}</span></td>
                       <td>{ex.description || "—"}</td>
                       <td style={{ color: "var(--text)" }}>₹{ex.amount.toLocaleString()}</td>
-                      <td><button className="btn btn-danger btn-sm" onClick={() => setExpenses(e => e.filter(x => x.id !== ex.id))}>×</button></td>
+                      <td><button className="btn btn-danger btn-sm" onClick={async () => {
+                        try {
+                          await api.removeExpense(ex.id);
+                          setExpenses(e => e.filter(x => x.id !== ex.id));
+                        } catch (err) {
+                          console.error(err);
+                        }
+                      }}>×</button></td>
                     </tr>
                   ))}
                 </tbody>
@@ -388,7 +221,6 @@ export default function VendorBudget({ eventData, aiResults, setAiResults, expen
             )}
           </div>
 
-          {/* Budget utilization bar */}
           <div className="card-sm mt-2">
             <div className="flex justify-between mb-1">
               <span style={{ fontSize: "12px", color: "var(--text2)" }}>Budget used</span>
@@ -400,30 +232,6 @@ export default function VendorBudget({ eventData, aiResults, setAiResults, expen
           </div>
         </div>
       </div>
-      )}
-      {eventData && selectedMapVendor && getEmbedUrl(selectedMapVendor) && (
-        <div className="card mt-3" style={{ borderColor: "rgba(159,133,255,0.25)" }}>
-          <div className="flex justify-between items-center mb-2">
-            <div>
-              <div style={{ fontSize: "12px", fontFamily: "DM Mono", color: "var(--text3)", textTransform: "uppercase" }}>
-                Local vendor map
-              </div>
-              <div style={{ fontSize: "15px", fontWeight: 500, color: "var(--text)", marginTop: "4px" }}>
-                {selectedMapVendor.name}
-              </div>
-            </div>
-            <span className="badge badge-accent">{selectedMapVendor.category}</span>
-          </div>
-          <iframe
-            title={`Map of ${selectedMapVendor.name}`}
-            src={getEmbedUrl(selectedMapVendor)}
-            style={{ width: "100%", height: "280px", border: "1px solid var(--border)", borderRadius: "10px" }}
-            loading="lazy"
-          />
-          <div style={{ marginTop: "0.65rem", fontSize: "12px", color: "var(--text3)" }}>
-            Showing nearest live vendor location from your selected city.
-          </div>
-        </div>
       )}
 
       {eventData && aiResults?.tips && (
@@ -438,27 +246,7 @@ export default function VendorBudget({ eventData, aiResults, setAiResults, expen
           </div>
         </div>
       )}
-      {eventData && aiResults?.bestOptions?.length > 0 && (
-        <div className="card mt-3" style={{ borderColor: "rgba(159,133,255,0.25)" }}>
-          <div style={{ fontSize: "12px", fontFamily: "DM Mono", color: "var(--text3)", textTransform: "uppercase", marginBottom: "0.75rem" }}>
-            Best options from your preferences
-          </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>
-            {aiResults.bestOptions.map((item, i) => (
-              <div key={`${item.category}-${i}`} className="card-sm" style={{ border: "1px solid rgba(159,133,255,0.2)" }}>
-                <div className="flex justify-between items-center mb-1">
-                  <span className="badge badge-accent">{item.category}</span>
-                  <span style={{ fontSize: "12px", color: "var(--teal)" }}>{item.estimatedCost}</span>
-                </div>
-                <div style={{ fontSize: "14px", color: "var(--text)", fontWeight: 500, marginBottom: "4px" }}>{item.option}</div>
-                <div style={{ fontSize: "12px", color: "var(--text2)" }}>{item.reason}</div>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
 
-      {/* New Browse Vendors Section */}
       <div className="section-header" style={{ marginTop: "3rem" }}>
         <h2 className="section-title">Browse Actual Vendors</h2>
         <p className="section-sub">Discover, tag, compare, and book vendors from our marketplace</p>
@@ -480,17 +268,12 @@ export default function VendorBudget({ eventData, aiResults, setAiResults, expen
           </button>
         </div>
 
-        <div className="flex justify-between items-center mb-2" style={{ gap: "10px", flexWrap: "wrap" }}>
-          <div style={{ fontSize: "12px", color: "var(--text3)" }}>
-            {effectiveLocation ? (
-              isLoadingMarket ? `Loading marketplace vendors for ${effectiveLocation}...` : `Showing marketplace vendors in ${effectiveLocation}`
-            ) : (isLoadingMarket ? "Loading marketplace vendors..." : "Showing all marketplace vendors (from Notion)")}
-          </div>
-          {marketError && <div style={{ fontSize: "12px", color: "var(--coral)" }}>{marketError}</div>}
-        </div>
-
         <div className="grid-3" style={{ gap: "1rem" }}>
-          {filteredVendors.map((v, i) => {
+          {filteredVendors.length === 0 ? (
+            <div className="card" style={{ gridColumn: "1 / -1", borderStyle: "dashed", textAlign: "center", padding: "2rem" }}>
+              <div style={{ color: "var(--text3)", fontSize: "13px" }}>No vendors listed yet. Vendors can register via the Vendor role.</div>
+            </div>
+          ) : filteredVendors.map((v, i) => {
             const isComparing = compareList.find(c => c.id === v.id);
             const status = bookings?.find(b => b.vendorId === v.id)?.status;
             return (
@@ -500,35 +283,12 @@ export default function VendorBudget({ eventData, aiResults, setAiResults, expen
                   <span style={{ fontSize: "12px", color: "var(--gold)" }}>{"★".repeat(Math.round(v.rating))} {v.rating}</span>
                 </div>
                 <div style={{ fontSize: "15px", fontWeight: 500, color: "var(--text)", marginBottom: "4px" }}>{v.organization}</div>
-                {v.location && <div style={{ fontSize: "12px", color: "var(--text3)", marginBottom: "4px" }}>📍 {v.location}</div>}
-                {(Number(v.priceMin) > 0 || Number(v.priceMax) > 0) && (
-                  <div style={{ fontSize: "13px", color: "var(--teal)", marginBottom: "4px" }}>
-                    ₹{Number(v.priceMin || 0).toLocaleString()} - ₹{Number(v.priceMax || 0).toLocaleString()}
-                  </div>
-                )}
-                {v.services && <div style={{ fontSize: "12px", color: "var(--text2)", marginBottom: "4px" }}>{v.services}</div>}
-                {v.aiTag && (
-                  <div style={{ marginBottom: "8px", display: "flex", flexDirection: "column", gap: "6px" }}>
-                    <div><span className="badge badge-accent" style={{ fontSize: "10px" }}>AI: {v.aiTag}</span></div>
-                    {v.aiTagReason && <div style={{ fontSize: "12px", color: "var(--text3)" }}>{v.aiTagReason}</div>}
-                  </div>
-                )}
-                
+                <div style={{ fontSize: "13px", color: "var(--teal)", marginBottom: "4px" }}>₹{v.priceMin} - ₹{v.priceMax}</div>
+                {v.aiTag && <div style={{ marginBottom: "8px" }}><span className="badge badge-accent" style={{ fontSize: "10px" }}>AI: {v.aiTag}</span></div>}
                 <div className="flex gap-2 mt-2">
-                  <button className="btn btn-primary btn-sm" style={{ flex: 1 }} onClick={() => requestBooking({ ...v, organization: v.organization })} disabled={!!status}>
+                  <button className="btn btn-primary btn-sm" style={{ flex: 1 }} onClick={() => requestBooking(v)} disabled={!!status}>
                     {status ? status : "Book"}
                   </button>
-                  {v.mapUrl && (
-                    <a
-                      href={v.mapUrl}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="btn btn-outline btn-sm"
-                      style={{ textDecoration: "none" }}
-                    >
-                      Map
-                    </a>
-                  )}
                   <label style={{ display: "flex", alignItems: "center", gap: "4px", fontSize: "12px", cursor: "pointer", color: "var(--text2)" }}>
                     <input type="checkbox" checked={!!isComparing} onChange={() => toggleCompare(v)} />
                     Compare
@@ -540,7 +300,6 @@ export default function VendorBudget({ eventData, aiResults, setAiResults, expen
         </div>
       </div>
 
-      {/* Comparison Drawer */}
       {compareList.length > 0 && (
         <div className="card" style={{ border: "1px solid var(--accent2)", marginTop: "1rem" }}>
           <div className="flex justify-between items-center mb-2">

@@ -1,23 +1,17 @@
 import { useState } from "react";
+import { api } from "../api";
 
 const EVENT_TYPES = ["Birthday Party", "Wedding", "Corporate Event", "College Fest", "Baby Shower", "Anniversary", "Graduation Party", "Conference", "Other"];
 
 export default function EventForm({ eventData, setEventData, setAiResults, onNext }) {
-  const [form, setForm] = useState({
+  const [form, setForm] = useState(eventData || {
     id: eventData?.id || `evt-${Date.now()}`,
     name: "", type: "Birthday Party", date: "", guestCount: "", location: "",
-    budgetMin: "", budgetMax: "", description: "",
-    wantSuggestions: false,
-    preferredVenueType: "",
-    preferredCuisine: "",
-    preferredVibe: "",
-    recommendationPriority: "Best Value",
-    ...(eventData || {})
+    budgetMin: "", budgetMax: "", description: ""
   });
   const [loading, setLoading] = useState(false);
   const [saved, setSaved] = useState(false);
-
-  const [notionStatus, setNotionStatus] = useState(null); // null | 'saving' | 'saved' | 'error'
+  const [notionStatus, setNotionStatus] = useState(null);
 
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
 
@@ -28,21 +22,16 @@ export default function EventForm({ eventData, setEventData, setAiResults, onNex
     }
     const nextEvent = { ...form, id: form.id || `evt-${Date.now()}` };
     setForm(nextEvent);
-    setEventData(nextEvent);
-    setAiResults(null);
     setLoading(true);
     setNotionStatus(null);
     try {
-      const response = await fetch("/api/generate-plan", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(nextEvent)
-      });
-      if (!response.ok) throw new Error("Backend AI Generation failed");
-      const parsed = await response.json();
+      await api.saveEvent(nextEvent);
+      setEventData(nextEvent);
+      setAiResults(null);
+      const parsed = await api.generatePlan(nextEvent);
       setAiResults(parsed);
       setSaved(true);
-      setNotionStatus('saved'); // backend saved to Notion during plan generation
+      setNotionStatus('saved');
       setTimeout(() => { setSaved(false); onNext(); }, 800);
     } catch (err) {
       console.error(err);
@@ -105,42 +94,6 @@ export default function EventForm({ eventData, setEventData, setAiResults, onNex
             <label className="form-label">Description / Special Requirements</label>
             <textarea className="form-textarea" placeholder="Any special requirements, theme, dietary needs..." value={form.description} onChange={e => set("description", e.target.value)} />
           </div>
-          <div className="card-sm" style={{ border: "1px solid rgba(61,207,176,0.2)" }}>
-            <label style={{ display: "flex", alignItems: "center", gap: "8px", color: "var(--text2)", fontSize: "13px", cursor: "pointer" }}>
-              <input
-                type="checkbox"
-                checked={!!form.wantSuggestions}
-                onChange={e => set("wantSuggestions", e.target.checked)}
-              />
-              Suggest best possible options based on my preferences
-            </label>
-            {form.wantSuggestions && (
-              <div style={{ marginTop: "0.75rem", display: "flex", flexDirection: "column", gap: "0.75rem" }}>
-                <div className="grid-2">
-                  <div className="form-group">
-                    <label className="form-label">Preferred Venue Type</label>
-                    <input className="form-input" placeholder="Banquet, Lawn, Beachside..." value={form.preferredVenueType} onChange={e => set("preferredVenueType", e.target.value)} />
-                  </div>
-                  <div className="form-group">
-                    <label className="form-label">Preferred Cuisine</label>
-                    <input className="form-input" placeholder="North Indian, Multi-cuisine..." value={form.preferredCuisine} onChange={e => set("preferredCuisine", e.target.value)} />
-                  </div>
-                </div>
-                <div className="grid-2">
-                  <div className="form-group">
-                    <label className="form-label">Event Vibe / Theme</label>
-                    <input className="form-input" placeholder="Elegant, Traditional, Minimal..." value={form.preferredVibe} onChange={e => set("preferredVibe", e.target.value)} />
-                  </div>
-                  <div className="form-group">
-                    <label className="form-label">Recommendation Priority</label>
-                    <select className="form-select" value={form.recommendationPriority} onChange={e => set("recommendationPriority", e.target.value)}>
-                      {["Best Value", "Premium Quality", "Balanced"].map(option => <option key={option}>{option}</option>)}
-                    </select>
-                  </div>
-                </div>
-              </div>
-            )}
-          </div>
         </div>
 
         <div style={{ display: "flex", flexDirection: "column", gap: "1rem" }}>
@@ -149,10 +102,8 @@ export default function EventForm({ eventData, setEventData, setAiResults, onNex
             {[
               { icon: "◈", label: "Vendor Suggestions", desc: "5+ categories with pricing" },
               { icon: "◆", label: "Budget Breakdown", desc: "Smart allocation by event type" },
-              { icon: "◎", label: "Location Cost Estimate", desc: "Expected min/max by city and guests" },
               { icon: "◷", label: "Task Timeline", desc: "Day-by-day checklist" },
-              { icon: "✦", label: "Expert Tips", desc: "Tailored to your event" },
-              { icon: "◇", label: "Preference Matches", desc: "Optional best options if enabled" }
+              { icon: "✦", label: "Expert Tips", desc: "Tailored to your event" }
             ].map(item => (
               <div key={item.label} className="flex items-center gap-2" style={{ padding: "10px 0", borderBottom: "1px solid var(--border)" }}>
                 <span style={{ color: "var(--accent2)", fontSize: "16px", width: "20px" }}>{item.icon}</span>

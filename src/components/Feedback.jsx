@@ -1,33 +1,39 @@
 import { useState } from "react";
+import { api } from "../api";
 
 export default function Feedback({ feedbackList, setFeedbackList, eventData }) {
   const [form, setForm] = useState({ name: "", overall: 0, venue: 0, catering: 0, organization: 0, comment: "", recommend: "" });
   const [analysis, setAnalysis] = useState(null);
   const [loading, setLoading] = useState(false);
-  const [notionToast, setNotionToast] = useState(null); // null | 'saving' | 'saved' | 'error'
+  const [notionToast, setNotionToast] = useState(null);
 
   const setRating = (field, val) => setForm(f => ({ ...f, [field]: val }));
 
   const submit = async () => {
     if (!form.overall) { alert("Please provide an overall rating"); return; }
-    const entry = { ...form, id: Date.now(), date: new Date().toLocaleDateString("en-IN") };
-    setFeedbackList(l => [...l, entry]);
-    setForm({ name: "", overall: 0, venue: 0, catering: 0, organization: 0, comment: "", recommend: "" });
-    alert("Thank you for your feedback!");
-
-    // Sync to Notion in background
-    setNotionToast('saving');
+    const entry = { ...form, date: new Date().toLocaleDateString("en-IN") };
     try {
-      const res = await fetch("/api/notion/save-feedback", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...entry, eventName: eventData?.name || "" }),
-      });
-      setNotionToast(res.ok ? 'saved' : 'error');
-    } catch {
-      setNotionToast('error');
+      const saved = await api.addFeedback(entry);
+      setFeedbackList(l => [...l, saved]);
+      setForm({ name: "", overall: 0, venue: 0, catering: 0, organization: 0, comment: "", recommend: "" });
+      alert("Thank you for your feedback!");
+
+      setNotionToast('saving');
+      try {
+        const res = await fetch("/api/notion/save-feedback", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ...saved, eventName: eventData?.name || "" }),
+        });
+        setNotionToast(res.ok ? 'saved' : 'error');
+      } catch {
+        setNotionToast('error');
+      }
+      setTimeout(() => setNotionToast(null), 4000);
+    } catch (err) {
+      console.error(err);
+      alert("Failed to submit feedback.");
     }
-    setTimeout(() => setNotionToast(null), 4000);
   };
 
   const analyzeFeedback = async () => {
@@ -35,13 +41,7 @@ export default function Feedback({ feedbackList, setFeedbackList, eventData }) {
     setLoading(true);
     try {
       const payload = feedbackList.map(f => ({ overall: f.overall, comment: f.comment, recommend: f.recommend }));
-      const response = await fetch("/api/analyze-feedback", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ feedbackList: payload })
-      });
-      if (!response.ok) throw new Error("Analysis API failed");
-      const data = await response.json();
+      const data = await api.analyzeFeedback(payload);
       setAnalysis(data.analysis);
     } catch (err) {
       console.error(err);
@@ -116,7 +116,7 @@ export default function Feedback({ feedbackList, setFeedbackList, eventData }) {
             <div style={{ marginTop: "8px", fontSize: "12px", color: "var(--teal)" }}>✅ Feedback backed up to Notion</div>
           )}
           {notionToast === 'error' && (
-            <div style={{ marginTop: "8px", fontSize: "12px", color: "var(--coral)" }}>⚠ Notion sync failed (saved locally)</div>
+            <div style={{ marginTop: "8px", fontSize: "12px", color: "var(--coral)" }}>⚠ Notion sync failed (saved on server)</div>
           )}
         </div>
 

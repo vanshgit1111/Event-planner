@@ -9,7 +9,7 @@
     "dev": "sh start.sh",
     "build": "vite build",
     "preview": "vite preview",
-    "start:backend": "node backend/server.js",
+    "start:backend": "GEMINI_API_KEY=$(grep GEMINI_API_KEY .env | cut -d= -f2) node backend/server.js",
     "setup-notion": "node backend/setup-notion.js"
   },
   "dependencies": {

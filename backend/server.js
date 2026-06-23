@@ -9,6 +9,7 @@ import cors from 'cors';
 import { readFileSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import * as store from './store.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -982,6 +983,9 @@ Rules:
     }).then(() => console.log(`✅ Notion: event "${name}" saved`))
       .catch(e  => console.error('Notion event save failed:', e.message));
 
+    store.setEvent({ name, type, date, guestCount, location, budgetMin, budgetMax, description, id: req.body.id || `evt-${Date.now()}` });
+    store.setAiResults(parsed);
+
     res.json(parsed);
   } catch (err) {
     console.error('generate-plan error:', err.message);
@@ -1053,14 +1057,27 @@ ${JSON.stringify(vendors)}`;
 app.get('/api/vendors', async (req, res) => {
   try {
     const location = String(req.query.location || '').trim();
+    if (!location) return res.json(store.listVendors());
     const limit = Math.min(60, Math.max(12, Number(req.query.limit || 36)));
-    if (!location) return res.status(400).json({ error: 'location required' });
     const vendors = await fetchLiveVendorList({ location, limit });
     return res.json({ vendors, source: vendors.length ? 'live' : 'none' });
   } catch (err) {
     console.error('vendors endpoint error:', err.message);
     res.status(500).json({ error: 'Failed to fetch vendors', details: err.message });
   }
+});
+
+app.post('/api/vendors', (req, res) => {
+  const vendor = req.body;
+  if (!vendor?.organization) return res.status(400).json({ error: 'organization required' });
+  const saved = store.upsertVendor({
+    ...vendor,
+    id: vendor.id || `v-${Date.now()}`,
+    priceMin: Number(vendor.priceMin) || 0,
+    priceMax: Number(vendor.priceMax) || 0,
+    rating: Number(vendor.rating) || 5,
+  });
+  res.json(saved);
 });
 
 
@@ -1370,6 +1387,158 @@ app.post('/api/notion/save-feedback', async (req, res) => {
     console.error('notion/save-feedback error:', err.message);
     res.status(500).json({ error: 'Failed to save feedback to Notion' });
   }
+});
+
+
+// ─── Data store API ────────────────────────────────────────────────────────────
+
+app.get('/api/data', (req, res) => {
+  res.json(store.getAll());
+});
+
+app.get('/api/event', (req, res) => {
+  const data = store.getAll();
+  res.json({ event: data.event, aiResults: data.aiResults });
+});
+
+app.put('/api/event', (req, res) => {
+  const { event } = req.body;
+  if (!event) return res.status(400).json({ error: 'event required' });
+  res.json({ event: store.setEvent(event) });
+});
+
+app.put('/api/ai-results', (req, res) => {
+  const { aiResults } = req.body;
+  res.json({ aiResults: store.setAiResults(aiResults) });
+});
+
+app.get('/api/bookings', (req, res) => {
+  res.json(store.listBookings());
+});
+
+app.post('/api/bookings', (req, res) => {
+  const booking = req.body;
+  if (!booking?.vendorId) return res.status(400).json({ error: 'vendorId required' });
+  const saved = store.addBooking({
+    ...booking,
+    id: booking.id || Date.now(),
+    budget: Number(booking.budget) || 0,
+    status: booking.status || 'Pending',
+  });
+  res.json(saved);
+});
+
+app.patch('/api/bookings/:id', (req, res) => {
+  const id = Number(req.params.id);
+  const updated = store.updateBooking(id, req.body);
+  if (!updated) return res.status(404).json({ error: 'Booking not found' });
+  res.json(updated);
+});
+
+app.get('/api/attendees', (req, res) => {
+  res.json(store.listAttendees());
+});
+
+app.post('/api/attendees', (req, res) => {
+  const attendee = req.body;
+  if (!attendee?.name || !attendee?.email) {
+    return res.status(400).json({ error: 'name and email required' });
+  }
+  res.json(store.addAttendee({ ...attendee, id: attendee.id || Date.now() }));
+});
+
+app.patch('/api/attendees/:id', (req, res) => {
+  const id = Number(req.params.id);
+  const updated = store.updateAttendee(id, req.body);
+  if (!updated) return res.status(404).json({ error: 'Attendee not found' });
+  res.json(updated);
+});
+
+app.delete('/api/attendees/:id', (req, res) => {
+  store.removeAttendee(Number(req.params.id));
+  res.json({ success: true });
+});
+
+app.post('/api/attendees/remind', (req, res) => {
+  const { id, bulk } = req.body;
+  const attendees = store.listAttendees();
+  if (bulk) {
+    const invited = attendees.filter(a => a.status === 'Invited');
+    return res.json({
+      success: true,
+      count: invited.length,
+      message: `Reminders queued for ${invited.length} invited attendee(s)`,
+    });
+  }
+  const att = attendees.find(a => a.id === id);
+  if (!att) return res.status(404).json({ error: 'Attendee not found' });
+  res.json({ success: true, message: `Reminder sent to ${att.name} at ${att.email}` });
+});
+
+app.post('/api/attendees/invite-preview', (req, res) => {
+  const { event } = req.body;
+  if (!event?.name) return res.status(400).json({ error: 'event required' });
+  const preview = `💌 You're Invited!\nJoin us for ${event.name}\n\n📅 Date: ${event.date || 'TBD'}\n📍 Location: ${event.location || 'To Be Decided'}\n\nWe would love for you to join us on this special day.\nPlease RSVP at your earliest convenience.`.trim();
+  res.json({ preview });
+});
+
+app.post('/api/attendees/send-invites', (req, res) => {
+  const count = store.listAttendees().filter(a => a.status === 'Invited').length;
+  res.json({ success: true, count, message: `Invitations sent to ${count} pending attendee(s)` });
+});
+
+app.get('/api/feedback', (req, res) => {
+  res.json(store.listFeedback());
+});
+
+app.post('/api/feedback', (req, res) => {
+  const entry = req.body;
+  if (!entry?.overall) return res.status(400).json({ error: 'overall rating required' });
+  res.json(store.addFeedback({
+    ...entry,
+    id: entry.id || Date.now(),
+    date: entry.date || new Date().toLocaleDateString('en-IN'),
+  }));
+});
+
+app.get('/api/expenses', (req, res) => {
+  res.json(store.listExpenses());
+});
+
+app.post('/api/expenses', (req, res) => {
+  const expense = req.body;
+  if (!expense?.category || !expense?.amount) {
+    return res.status(400).json({ error: 'category and amount required' });
+  }
+  res.json(store.addExpense({ ...expense, id: expense.id || Date.now(), amount: Number(expense.amount) }));
+});
+
+app.delete('/api/expenses/:id', (req, res) => {
+  store.removeExpense(Number(req.params.id));
+  res.json({ success: true });
+});
+
+app.get('/api/messages', (req, res) => {
+  res.json(store.listMessages(req.query.vendorId || undefined));
+});
+
+app.post('/api/messages', (req, res) => {
+  const message = req.body;
+  if (!message?.vendorId || !message?.text) {
+    return res.status(400).json({ error: 'vendorId and text required' });
+  }
+  res.json(store.addMessage({
+    ...message,
+    id: message.id || Date.now(),
+    timestamp: message.timestamp || new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }),
+  }));
+});
+
+app.delete('/api/messages', (req, res) => {
+  const { vendorId } = req.query;
+  if (!vendorId) return res.status(400).json({ error: 'vendorId required' });
+  store.clearMessages(vendorId);
+  res.json({ success: true });
 });
 
 

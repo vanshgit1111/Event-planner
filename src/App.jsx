@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import EventForm from "./components/EventForm";
 import VendorBudget from "./components/VendorBudget";
 import Timeline from "./components/Timeline";
@@ -8,6 +8,7 @@ import Analytics from "./components/Analytics";
 import Chat from "./components/Chat";
 import VendorProfile from "./components/VendorProfile";
 import VendorDashboard from "./components/VendorDashboard";
+import { api } from "./api";
 import "./App.css";
 
 const userTabs = [
@@ -31,8 +32,7 @@ function useLocalStorage(key, initialValue) {
     try {
       const item = window.localStorage.getItem(key);
       return item ? JSON.parse(item) : initialValue;
-    } catch (error) {
-      console.error(error);
+    } catch {
       return initialValue;
     }
   });
@@ -52,34 +52,52 @@ function useLocalStorage(key, initialValue) {
 export default function App() {
   const [role, setRole] = useLocalStorage("em_role", null);
   const [activeTab, setActiveTab] = useLocalStorage("em_activeTab", "create");
-  const [eventData, setEventData] = useLocalStorage("em_eventData", null);
-  const [aiResults, setAiResults] = useLocalStorage("em_aiResults", null);
-  const [attendees, setAttendees] = useLocalStorage("em_attendees", []);
-  const [feedbackList, setFeedbackList] = useLocalStorage("em_feedbackList", []);
-  const [expenses, setExpenses] = useLocalStorage("em_expenses", []);
 
-  // Marketplace states
-  const [vendors, setVendors] = useLocalStorage("em_vendors", [
-    { id: "v1", category: "Venue", organization: "Grand Palace", priceMin: 50000, priceMax: 150000, rating: 4.8, location: "Mumbai", services: "AC Hall, Valet", contact: "contact@grandpalace.in" },
-    { id: "v2", category: "Catering", organization: "Spice Route", priceMin: 20000, priceMax: 80000, rating: 4.5, location: "Mumbai", services: "North Indian, South Indian", contact: "hello@spiceroute.in" },
-    { id: "v3", category: "Photography", organization: "Lens Craft", priceMin: 15000, priceMax: 50000, rating: 4.9, location: "Navi Mumbai", services: "Candid, Drone", contact: "lenscraft@gmail.com" }
-  ]);
-  const [bookings, setBookings] = useLocalStorage("em_bookings", []);
-  const [messages, setMessages] = useLocalStorage("em_messages", []);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(null);
+
+  const [eventData, setEventData] = useState(null);
+  const [aiResults, setAiResults] = useState(null);
+  const [attendees, setAttendees] = useState([]);
+  const [feedbackList, setFeedbackList] = useState([]);
+  const [expenses, setExpenses] = useState([]);
+  const [vendors, setVendors] = useState([]);
+  const [bookings, setBookings] = useState([]);
+  const [messages, setMessages] = useState([]);
+
   const [notionReady, setNotionReady] = useState(null);
   const [showNotionBanner, setShowNotionBanner] = useState(true);
 
-  // Check Notion status on mount + auto-dismiss banner after 6s
-  useEffect(() => {
-    fetch("/api/health")
-      .then(r => r.json())
-      .then(d => setNotionReady(d?.notion?.connected === true))
-      .catch(() => setNotionReady(false));
-    const t = setTimeout(() => setShowNotionBanner(false), 6000);
-    return () => clearTimeout(t);
+  const refreshData = useCallback(async () => {
+    try {
+      const [data, health] = await Promise.all([
+        api.getData(),
+        api.health().catch(() => null),
+      ]);
+      setEventData(data.event);
+      setAiResults(data.aiResults);
+      setAttendees(data.attendees || []);
+      setFeedbackList(data.feedback || []);
+      setExpenses(data.expenses || []);
+      setVendors(data.vendors || []);
+      setBookings(data.bookings || []);
+      setMessages(data.messages || []);
+      if (health) setNotionReady(health?.notion?.connected === true);
+      setLoadError(null);
+    } catch (err) {
+      console.error("Failed to load data:", err);
+      setLoadError("Could not connect to backend. Make sure the server is running (npm run dev).");
+    } finally {
+      setLoading(false);
+    }
   }, []);
 
-  // Sync tab state when switching roles
+  useEffect(() => {
+    refreshData();
+    const t = setTimeout(() => setShowNotionBanner(false), 6000);
+    return () => clearTimeout(t);
+  }, [refreshData]);
+
   useEffect(() => {
     if (role === "User" && !userTabs.find(t => t.id === activeTab)) setActiveTab("create");
     if (role === "Vendor" && !vendorTabs.find(t => t.id === activeTab)) setActiveTab("dashboard");
@@ -102,6 +120,17 @@ export default function App() {
               I'm a Vendor / Business
             </button>
           </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (loading) {
+    return (
+      <div className="app" style={{ display: "flex", alignItems: "center", justifyContent: "center", minHeight: "100vh" }}>
+        <div className="card" style={{ textAlign: "center", padding: "2rem" }}>
+          <div className="ai-dot" /><div className="ai-dot" /><div className="ai-dot" />
+          <div style={{ marginTop: "1rem", color: "var(--text2)" }}>Loading from server...</div>
         </div>
       </div>
     );
@@ -134,8 +163,25 @@ export default function App() {
         </div>
       </header>
 
-      {/* Notion setup banner */}
-      {notionReady === false && showNotionBanner && (
+      {loadError && (
+        <div style={{
+          background: "rgba(255,100,100,0.08)",
+          borderBottom: "1px solid rgba(255,100,100,0.2)",
+          padding: "10px 2rem",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          gap: "12px",
+          fontSize: "13px",
+          color: "var(--coral)",
+        }}>
+          <span>⚠</span>
+          <span>{loadError}</span>
+          <button className="btn btn-sm btn-outline" onClick={refreshData}>Retry</button>
+        </div>
+      )}
+
+      {notionReady === false && showNotionBanner && !loadError && (
         <div style={{
           background: "rgba(245,200,66,0.08)",
           borderBottom: "1px solid rgba(245,200,66,0.2)",
@@ -148,12 +194,11 @@ export default function App() {
           color: "var(--gold)",
         }}>
           <span>⚠</span>
-          <span>Notion sync not configured — data is saved locally only.</span>
-          <a href="/NOTION_SETUP.md" target="_blank" style={{ color: "var(--gold)", textDecoration: "underline", fontWeight: 500 }}>Setup guide</a>
+          <span>Notion sync not configured — data is saved on the server locally.</span>
           <button onClick={() => setShowNotionBanner(false)} style={{ background: "none", border: "none", color: "var(--text3)", cursor: "pointer", fontSize: "16px", marginLeft: "4px" }}>×</button>
         </div>
       )}
-      {notionReady === true && showNotionBanner && (
+      {notionReady === true && showNotionBanner && !loadError && (
         <div style={{
           background: "rgba(61,207,176,0.06)",
           borderBottom: "1px solid rgba(61,207,176,0.15)",
@@ -184,7 +229,6 @@ export default function App() {
           <VendorBudget
             eventData={eventData}
             aiResults={aiResults}
-            setAiResults={setAiResults}
             expenses={expenses}
             setExpenses={setExpenses}
             vendors={vendors}
@@ -214,7 +258,6 @@ export default function App() {
           />
         )}
 
-        {/* Vendor Role Screens */}
         {activeTab === "dashboard" && (
           <VendorDashboard bookings={bookings} setBookings={setBookings} />
         )}
@@ -222,7 +265,6 @@ export default function App() {
           <VendorProfile vendors={vendors} setVendors={setVendors} />
         )}
 
-        {/* Shared Chat Screen */}
         {activeTab === "chat" && (
           <Chat role={role} messages={messages} setMessages={setMessages} vendors={vendors} eventData={eventData} />
         )}

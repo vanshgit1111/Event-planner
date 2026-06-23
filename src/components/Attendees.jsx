@@ -1,71 +1,54 @@
 import { useState } from "react";
+import { api } from "../api";
 
 const STATUS = ["Invited", "Confirmed", "Declined", "Maybe"];
-const STATUS_BADGE = { Invited: "badge-accent", Confirmed: "badge-teal", Declined: "badge-coral", Maybe: "badge-gold" };
 
 export default function Attendees({ eventData, attendees, setAttendees }) {
   const [form, setForm] = useState({ name: "", email: "", phone: "", status: "Invited", group: "" });
   const [search, setSearch] = useState("");
   const [filterStatus, setFilterStatus] = useState("All");
   const [invitePreview, setInvitePreview] = useState(null);
-  const [aiTemplates, setAiTemplates] = useState([]);
-  const [isGeneratingTemplates, setIsGeneratingTemplates] = useState(false);
-  const [templatesError, setTemplatesError] = useState("");
 
-  const generateInvite = () => {
+  const generateInvite = async () => {
     if (!eventData) return alert("Create an event first!");
-    setInvitePreview(`
-💌 You're Invited!
-Join us for ${eventData.name}
-
-📅 Date: ${eventData.date}
-📍 Location: ${eventData.location || "To Be Decided"}
-
-We would love for you to join us on this special day.
-Please RSVP at your earliest convenience.
-    `);
-  };
-
-  const generateAiTemplates = async () => {
-    if (!eventData) return alert("Create an event first!");
-    setIsGeneratingTemplates(true);
-    setTemplatesError("");
     try {
-      const res = await fetch("/api/invitation-templates", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name: eventData.name,
-          type: eventData.type,
-          date: eventData.date,
-          location: eventData.location,
-          guestCount: eventData.guestCount,
-          description: eventData.description,
-          hostName: "",
-        })
-      });
-      if (!res.ok) throw new Error("Failed to generate templates");
-      const data = await res.json();
-      const list = Array.isArray(data?.templates) ? data.templates : [];
-      setAiTemplates(list.slice(0, 3));
-      if (list.length === 0) setTemplatesError("No templates returned. Try again.");
-    } catch (e) {
-      console.error(e);
-      setTemplatesError("AI template generation failed. Please try again.");
-      setAiTemplates([]);
-    } finally {
-      setIsGeneratingTemplates(false);
+      const { preview } = await api.invitePreview(eventData);
+      setInvitePreview(preview);
+    } catch (err) {
+      console.error(err);
+      alert("Failed to generate invite preview.");
     }
   };
 
-  const add = () => {
+  const add = async () => {
     if (!form.name || !form.email) { alert("Name and email required"); return; }
-    setAttendees(a => [...a, { ...form, id: Date.now() }]);
-    setForm({ name: "", email: "", phone: "", status: "Invited", group: "" });
+    try {
+      const saved = await api.addAttendee(form);
+      setAttendees(a => [...a, saved]);
+      setForm({ name: "", email: "", phone: "", status: "Invited", group: "" });
+    } catch (err) {
+      console.error(err);
+      alert("Failed to add attendee.");
+    }
   };
 
-  const updateStatus = (id, status) => setAttendees(a => a.map(x => x.id === id ? { ...x, status } : x));
-  const remove = (id) => setAttendees(a => a.filter(x => x.id !== id));
+  const updateStatus = async (id, status) => {
+    try {
+      const updated = await api.updateAttendee(id, { status });
+      setAttendees(a => a.map(x => x.id === id ? updated : x));
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const remove = async (id) => {
+    try {
+      await api.removeAttendee(id);
+      setAttendees(a => a.filter(x => x.id !== id));
+    } catch (err) {
+      console.error(err);
+    }
+  };
 
   const filtered = attendees.filter(a => {
     const matchSearch = a.name.toLowerCase().includes(search.toLowerCase()) || a.email.toLowerCase().includes(search.toLowerCase());
@@ -75,13 +58,24 @@ Please RSVP at your earliest convenience.
 
   const counts = STATUS.reduce((acc, s) => ({ ...acc, [s]: attendees.filter(a => a.status === s).length }), {});
 
-  const sendReminder = (att) => {
-    alert(`Reminder sent to ${att.name} at ${att.email}!\n(In production, this triggers SendGrid/Twilio via Zapier)`);
+  const sendReminder = async (att) => {
+    try {
+      const result = await api.remindAttendee(att.id);
+      alert(result.message);
+    } catch (err) {
+      console.error(err);
+      alert("Failed to send reminder.");
+    }
   };
 
-  const bulkRemind = () => {
-    const invited = attendees.filter(a => a.status === "Invited");
-    alert(`Sending reminders to ${invited.length} invited attendees!\n(In production: Zapier → SendGrid/Twilio automation)`);
+  const bulkRemind = async () => {
+    try {
+      const result = await api.bulkRemind();
+      alert(result.message);
+    } catch (err) {
+      console.error(err);
+      alert("Failed to send reminders.");
+    }
   };
 
   return (
@@ -214,56 +208,21 @@ Please RSVP at your earliest convenience.
 
           <div className="flex justify-between items-center mt-3 mb-2">
              <div style={{ fontSize: "14px", fontWeight: 500 }}>Invitation Templates</div>
-             <div className="flex gap-1">
-               <button className="btn btn-outline btn-sm" onClick={generateInvite}>Generate Preview</button>
-               <button className="btn btn-ai btn-sm" onClick={generateAiTemplates} disabled={isGeneratingTemplates}>
-                 {isGeneratingTemplates ? "Generating..." : "✦ Generate AI Examples"}
-               </button>
-             </div>
+             <button className="btn btn-outline btn-sm" onClick={generateInvite}>Generate Preview</button>
           </div>
-
-          {templatesError && (
-            <div className="card-sm mb-2" style={{ borderColor: "rgba(255,107,91,0.35)", color: "var(--coral)" }}>
-              {templatesError}
-            </div>
-          )}
-
-          {aiTemplates.length > 0 && (
-            <div style={{ display: "flex", flexDirection: "column", gap: "10px", marginBottom: "12px" }}>
-              {aiTemplates.map((t, idx) => (
-                <div key={`${t.title}-${idx}`} className="card" style={{ background: "rgba(255,255,255,0.03)" }}>
-                  <div className="flex justify-between items-center mb-2">
-                    <div style={{ fontWeight: 600, color: "var(--text)" }}>{t.title}</div>
-                    <span className="badge badge-accent">{t.channel || "template"}</span>
-                  </div>
-                  <div style={{ fontFamily: "DM Mono", whiteSpace: "pre-wrap", fontSize: "13px", color: "var(--text2)" }}>
-                    {t.text}
-                  </div>
-                  <div style={{ marginTop: "10px" }}>
-                    <button
-                      className="btn btn-outline btn-sm"
-                      onClick={async () => {
-                        try {
-                          await navigator.clipboard.writeText(t.text || "");
-                          alert("Copied to clipboard!");
-                        } catch {
-                          alert("Copy failed. Please copy manually.");
-                        }
-                      }}
-                    >
-                      Copy
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-
           {invitePreview && (
             <div className="card" style={{ background: "rgba(255,255,255,0.03)", fontFamily: "DM Mono", whiteSpace: "pre-wrap", fontSize: "13px", color: "var(--text2)" }}>
               {invitePreview}
               <div style={{ marginTop: "1rem" }}>
-                <button className="btn btn-primary btn-sm" onClick={() => alert("Invitations sent via email to all Pending attendees!")}>Send to Pending RSVPs</button>
+                <button className="btn btn-primary btn-sm" onClick={async () => {
+                  try {
+                    const result = await api.sendInvites();
+                    alert(result.message);
+                  } catch (err) {
+                    console.error(err);
+                    alert("Failed to send invitations.");
+                  }
+                }}>Send to Pending RSVPs</button>
               </div>
             </div>
           )}
