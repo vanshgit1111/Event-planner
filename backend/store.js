@@ -3,7 +3,8 @@ import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = resolve(__dirname, 'data');
+const isVercel = process.env.VERCEL === '1' || !!process.env.VERCEL;
+const DATA_DIR = isVercel ? '/tmp' : resolve(__dirname, 'data');
 const STORE_PATH = resolve(DATA_DIR, 'store.json');
 
 const DEFAULT_STORE = {

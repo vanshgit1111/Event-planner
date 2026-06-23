@@ -2271,3 +2271,5 @@ wss.on('connection', (ws) => {
     console.error('WS socket error:', err.message);
   });
 });
+
+export default app;
