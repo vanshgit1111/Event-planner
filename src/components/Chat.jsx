@@ -25,7 +25,7 @@ export default function Chat({ role, messages, setMessages, vendors, eventData }
 
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
       const host = window.location.host;
-      const wsUrl = `${protocol}//${host}/api/chat-ws`;
+      const wsUrl = import.meta.env.VITE_WS_URL || `${protocol}//${host}/api/chat-ws`;
 
       console.log(`Connecting to WebSocket: ${wsUrl}`);
       const socket = new WebSocket(wsUrl);
