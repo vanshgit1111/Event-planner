@@ -278,7 +278,7 @@ Or connect your GitHub repo at [vercel.com](https://vercel.com):
 3. Add environment variables in Vercel dashboard
 4. Click **Deploy**
 
-> **Live URL**: [https://event-planner-vansh.vercel.app](https://event-planner-vansh.vercel.app) *(update after deployment)*
+> **Live URL**: [https://event-planner-vanshgit1111.vercel.app](https://event-planner-vanshgit1111.vercel.app)
 
 ### Backend Deployment Options
 - **Railway** — `railway up` (recommended for Express backends)
