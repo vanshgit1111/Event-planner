@@ -9,6 +9,8 @@ import cors from 'cors';
 import { readFileSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { WebSocketServer } from 'ws';
+import nodemailer from 'nodemailer';
 import * as store from './store.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -33,24 +35,257 @@ function loadEnv() {
 loadEnv();
 
 const GEMINI_API_KEY    = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL      = 'gemini-2.0-flash';
+const GEMINI_MODEL      = 'gemini-2.5-flash';
 const GEMINI_URL        = GEMINI_API_KEY
   ? `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`
   : null;
 
-const NOTION_TOKEN      = process.env.NOTION_TOKEN;
-const NOTION_VERSION    = '2022-06-28';
-const NOTION_DB_EVENTS  = process.env.NOTION_DB_EVENTS;
-const NOTION_DB_VENDORS = process.env.NOTION_DB_VENDORS;
-const NOTION_DB_BOOKINGS= process.env.NOTION_DB_BOOKINGS;
-const NOTION_DB_FEEDBACK= process.env.NOTION_DB_FEEDBACK;
+const NOTION_TOKEN       = process.env.NOTION_TOKEN;
+const NOTION_VERSION     = '2022-06-28';
+const NOTION_DB_EVENTS   = process.env.NOTION_DB_EVENTS;
+const NOTION_DB_VENDORS  = process.env.NOTION_DB_VENDORS;
+const NOTION_DB_BOOKINGS = process.env.NOTION_DB_BOOKINGS;
+const NOTION_DB_FEEDBACK = process.env.NOTION_DB_FEEDBACK;
+const NOTION_DB_CHAT_LOGS = process.env.NOTION_DB_CHAT_LOGS;
 const GOOGLE_PLACES_API_KEY = process.env.GOOGLE_PLACES_API_KEY;
 const GEOAPIFY_API_KEY = process.env.GEOAPIFY_API_KEY;
+
+// ─── SMTP Email Configuration ──────────────────────────────────────────────────
+const SMTP_HOST = process.env.SMTP_HOST || 'smtp.gmail.com';
+const SMTP_PORT = Number(process.env.SMTP_PORT) || 587;
+const SMTP_USER = process.env.SMTP_USER;
+const SMTP_PASS = process.env.SMTP_PASS;
+const SMTP_FROM = process.env.SMTP_FROM;
+
+let emailTransporter = null;
+
+function getEmailTransporter() {
+  if (emailTransporter) return emailTransporter;
+  if (!SMTP_USER || !SMTP_PASS) {
+    return null;
+  }
+  try {
+    emailTransporter = nodemailer.createTransport({
+      host: SMTP_HOST,
+      port: SMTP_PORT,
+      secure: SMTP_PORT === 465,
+      auth: {
+        user: SMTP_USER,
+        pass: SMTP_PASS,
+      },
+    });
+    console.log(`✉️ Nodemailer SMTP transporter initialized with host: ${SMTP_HOST}`);
+  } catch (err) {
+    console.error('❌ Failed to initialize Nodemailer SMTP transporter:', err.message);
+  }
+  return emailTransporter;
+}
+
+async function sendEmail({ to, subject, text, html }) {
+  const transporter = getEmailTransporter();
+  const from = SMTP_FROM || SMTP_USER || 'no-reply@eventmind.com';
+  if (!transporter) {
+    console.log(`✉️ [MOCK EMAIL] To: ${to} | Subject: ${subject}`);
+    console.log(`Body: ${text}`);
+    return { mock: true, message: 'SMTP credentials not configured, printed to console' };
+  }
+  return transporter.sendMail({
+    from,
+    to,
+    subject,
+    text,
+    html
+  });
+}
 
 const app  = express();
 app.use(cors());
 app.use(express.json());
 const PORT = 5001;
+
+// ─── Caching, Resilience, Notion Update & Upsert Helpers ───────────────────────
+const vendorSearchCache = new Map();
+const CACHE_TTL = 3600000; // 1 hour
+
+// IP-based Rate Limiter (max 30 requests/minute per client IP)
+const rateLimitWindow = 60000;
+const rateLimitMax = 30;
+const requestTracks = new Map();
+
+function rateLimiter(req, res, next) {
+  const ip = req.ip || req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+  const now = Date.now();
+  if (!requestTracks.has(ip)) {
+    requestTracks.set(ip, []);
+  }
+  const timestamps = requestTracks.get(ip).filter(t => now - t < rateLimitWindow);
+  if (timestamps.length >= rateLimitMax) {
+    console.warn(`Rate limit exceeded for IP: ${ip}`);
+    return res.status(429).json({ error: 'Too many requests. Please try again in a minute.' });
+  }
+  timestamps.push(now);
+  requestTracks.set(ip, timestamps);
+  next();
+}
+
+// Resilient Fetch with Timeout and Retry
+async function fetchWithRetryAndTimeout(url, options = {}, retries = 2, timeout = 12000) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    const controller = new AbortController();
+    const id = setTimeout(() => controller.abort(), timeout);
+    try {
+      const response = await fetch(url, { ...options, signal: controller.signal });
+      clearTimeout(id);
+      if (!response.ok) {
+        throw new Error(`HTTP error ${response.status}`);
+      }
+      return response;
+    } catch (err) {
+      clearTimeout(id);
+      console.warn(`Fetch attempt ${attempt} failed for ${url}: ${err.message}`);
+      if (attempt === retries) {
+        throw err;
+      }
+      await new Promise((r) => setTimeout(r, Math.pow(2, attempt) * 500));
+    }
+  }
+}
+
+// Notion Update Page API
+async function notionUpdate(pageId, properties) {
+  if (!NOTION_TOKEN || !pageId) return null;
+  try {
+    const res = await fetch(`https://api.notion.com/v1/pages/${pageId}`, {
+      method: 'PATCH',
+      headers: {
+        'Authorization':  `Bearer ${NOTION_TOKEN}`,
+        'Notion-Version': NOTION_VERSION,
+        'Content-Type':   'application/json',
+      },
+      body: JSON.stringify({ properties }),
+    });
+    if (!res.ok) {
+      const err = await res.text();
+      console.error(`Notion update failed (Page: ${pageId}):`, err);
+      return null;
+    }
+    return await res.json();
+  } catch (e) {
+    console.error('Notion update exception:', e.message);
+    return null;
+  }
+}
+
+// Notion Event Upsert (de-duplication by Event Name)
+async function notionUpsertEvent(name, properties) {
+  if (!NOTION_TOKEN || !NOTION_DB_EVENTS) return null;
+  try {
+    const queryResult = await notionQuery(NOTION_DB_EVENTS, {
+      filter: { property: 'Name', title: { equals: name } }
+    });
+    const existingPage = queryResult?.results?.[0];
+    if (existingPage) {
+      console.log(`🔄 Notion: Event "${name}" already exists. Updating page ID: ${existingPage.id}`);
+      return await notionUpdate(existingPage.id, properties);
+    } else {
+      console.log(`➕ Notion: Creating new Event "${name}"`);
+      return await notionInsert(NOTION_DB_EVENTS, properties);
+    }
+  } catch (err) {
+    console.error('notionUpsertEvent error:', err.message);
+  }
+}
+
+// Notion Vendor Upsert (de-duplication by Organization)
+async function notionUpsertVendor(organization, properties) {
+  if (!NOTION_TOKEN || !NOTION_DB_VENDORS) return null;
+  try {
+    const queryResult = await notionQuery(NOTION_DB_VENDORS, {
+      filter: { property: 'Organization', title: { equals: organization } }
+    });
+    const existingPage = queryResult?.results?.[0];
+    if (existingPage) {
+      console.log(`🔄 Notion: Vendor "${organization}" already exists. Updating page ID: ${existingPage.id}`);
+      return await notionUpdate(existingPage.id, properties);
+    } else {
+      console.log(`➕ Notion: Creating new Vendor "${organization}"`);
+      return await notionInsert(NOTION_DB_VENDORS, properties);
+    }
+  } catch (err) {
+    console.error('notionUpsertVendor error:', err.message);
+  }
+}
+
+// Notion Booking Upsert (de-duplication by Event Name + Vendor)
+async function notionUpsertBooking(eventName, vendorName, properties) {
+  if (!NOTION_TOKEN || !NOTION_DB_BOOKINGS) return null;
+  try {
+    const queryResult = await notionQuery(NOTION_DB_BOOKINGS, {
+      filter: {
+        and: [
+          { property: 'Event Name', title: { equals: eventName } },
+          { property: 'Vendor', rich_text: { equals: vendorName } }
+        ]
+      }
+    });
+    const existingPage = queryResult?.results?.[0];
+    if (existingPage) {
+      console.log(`🔄 Notion: Booking for "${eventName}" with "${vendorName}" already exists. Updating ID: ${existingPage.id}`);
+      return await notionUpdate(existingPage.id, properties);
+    } else {
+      console.log(`➕ Notion: Creating new Booking for "${eventName}"`);
+      return await notionInsert(NOTION_DB_BOOKINGS, properties);
+    }
+  } catch (err) {
+    console.error('notionUpsertBooking error:', err.message);
+  }
+}
+
+// Notion Chat Log Upsert (de-duplication by Message ID)
+async function notionUpsertChatLog(messageId, properties) {
+  if (!NOTION_TOKEN || !NOTION_DB_CHAT_LOGS) return null;
+  try {
+    const queryResult = await notionQuery(NOTION_DB_CHAT_LOGS, {
+      filter: { property: 'Message ID', title: { equals: String(messageId) } }
+    });
+    const existingPage = queryResult?.results?.[0];
+    if (existingPage) {
+      return await notionUpdate(existingPage.id, properties);
+    } else {
+      return await notionInsert(NOTION_DB_CHAT_LOGS, properties);
+    }
+  } catch (err) {
+    console.error('notionUpsertChatLog error:', err.message);
+  }
+}
+
+// Scoring and Ranking for Vendor Recommendations
+function calculateVendorScore(vendor, categoryBudget, guestCount) {
+  let score = 0;
+  score += (Number(vendor.rating) || 4.0) * 10; // up to 50 pts
+  if (categoryBudget > 0) {
+    const minCost = estimateVendorMinCost(vendor, guestCount);
+    if (minCost <= categoryBudget) {
+      score += 40; // fully within budget
+    } else if (minCost <= categoryBudget * 1.15) {
+      score += 25; // slightly over budget
+    } else if (minCost <= categoryBudget * 1.3) {
+      score += 10; // moderately over budget
+    }
+  } else {
+    score += 20;
+  }
+  return score;
+}
+
+function rankVendors(vendors, budgetBreakdown, guestCount) {
+  const alloc = Object.fromEntries((budgetBreakdown || []).map((b) => [b.category, Number(b.amount) || 0]));
+  return [...vendors].sort((a, b) => {
+    const scoreA = calculateVendorScore(a, alloc[a.category] || 0, guestCount);
+    const scoreB = calculateVendorScore(b, alloc[b.category] || 0, guestCount);
+    return scoreB - scoreA;
+  });
+}
 
 
 // ─── Gemini helper ────────────────────────────────────────────────────────────
@@ -269,26 +504,34 @@ function budgetBasedRange(amount, guestCount, isPerPlate = false) {
 }
 
 async function geocodeLocation(location) {
-  const q = encodeURIComponent(location || 'India');
-  const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${q}`, {
-    headers: { 'User-Agent': 'EventMind/1.0 (event planner app)' }
-  });
-  if (!res.ok) return null;
-  const data = await res.json();
-  if (!Array.isArray(data) || !data[0]) return null;
-  return { lat: Number(data[0].lat), lon: Number(data[0].lon) };
+  try {
+    const q = encodeURIComponent(location || 'India');
+    const res = await fetchWithRetryAndTimeout(`https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${q}`, {
+      headers: { 'User-Agent': 'EventMind/1.0 (event planner app)' }
+    });
+    const data = await res.json();
+    if (!Array.isArray(data) || !data[0]) return null;
+    return { lat: Number(data[0].lat), lon: Number(data[0].lon) };
+  } catch (err) {
+    console.warn('geocodeLocation failed:', err.message);
+    return null;
+  }
 }
 
 async function geocodeLocationGeoapify(location) {
   if (!GEOAPIFY_API_KEY) return null;
-  const q = encodeURIComponent(location || 'India');
-  const url = `https://api.geoapify.com/v1/geocode/search?text=${q}&limit=1&apiKey=${GEOAPIFY_API_KEY}`;
-  const res = await fetch(url);
-  if (!res.ok) return null;
-  const data = await res.json();
-  const coords = data?.features?.[0]?.geometry?.coordinates;
-  if (!Array.isArray(coords) || coords.length < 2) return null;
-  return { lat: Number(coords[1]), lon: Number(coords[0]) };
+  try {
+    const q = encodeURIComponent(location || 'India');
+    const url = `https://api.geoapify.com/v1/geocode/search?text=${q}&limit=1&apiKey=${GEOAPIFY_API_KEY}`;
+    const res = await fetchWithRetryAndTimeout(url);
+    const data = await res.json();
+    const coords = data?.features?.[0]?.geometry?.coordinates;
+    if (!Array.isArray(coords) || coords.length < 2) return null;
+    return { lat: Number(coords[1]), lon: Number(coords[0]) };
+  } catch (err) {
+    console.warn('geocodeLocationGeoapify failed:', err.message);
+    return null;
+  }
 }
 
 async function fetchGeoapifyVendors({ location, budgetBreakdown, guestCount }) {
@@ -298,34 +541,53 @@ async function fetchGeoapifyVendors({ location, budgetBreakdown, guestCount }) {
 
   const alloc = Object.fromEntries((budgetBreakdown || []).map((b) => [b.category, Number(b.amount) || 0]));
   const categories = [
-    { category: 'Venue', apiCategory: 'catering', allocKey: 'Venue', perPlate: false, fallbackName: 'Event venue' },
+    { category: 'Venue', apiCategory: 'activity.events_venue,accommodation.hotel', allocKey: 'Venue', perPlate: false, fallbackName: 'Event venue' },
     { category: 'Catering', apiCategory: 'catering.restaurant', allocKey: 'Catering', perPlate: true, fallbackName: 'Catering service' },
-    { category: 'Photography', apiCategory: 'commercial.photo_studio', allocKey: 'Photography', perPlate: false, fallbackName: 'Photography vendor' },
+    { category: 'Photography', apiCategory: 'service.photographer,commercial.hobby.photo', allocKey: 'Photography', perPlate: false, fallbackName: 'Photography vendor' },
     { category: 'Decoration', apiCategory: 'commercial.florist', allocKey: 'Decoration', perPlate: false, fallbackName: 'Decoration vendor' },
     { category: 'Entertainment', apiCategory: 'entertainment', allocKey: 'Entertainment', perPlate: false, fallbackName: 'Entertainment vendor' },
   ];
 
   const calls = categories.map(async (c) => {
-    const url = `https://api.geoapify.com/v2/places?categories=${encodeURIComponent(c.apiCategory)}&filter=circle:${center.lon},${center.lat},10000&bias=proximity:${center.lon},${center.lat}&limit=5&apiKey=${GEOAPIFY_API_KEY}`;
-    const resp = await fetch(url);
-    if (!resp.ok) return null;
-    const data = await resp.json();
-    const place = data?.features?.[0]?.properties;
-    if (!place) return null;
-    const displayName = place.name || place.formatted || c.fallbackName;
+    try {
+      const url = `https://api.geoapify.com/v2/places?categories=${c.apiCategory}&filter=circle:${center.lon},${center.lat},10000&bias=proximity:${center.lon},${center.lat}&limit=5&apiKey=${GEOAPIFY_API_KEY}`;
+      const resp = await fetchWithRetryAndTimeout(url);
+      const data = await resp.json();
+      const place = data?.features?.[0]?.properties;
+      if (!place) return null;
+      const displayName = place.name || place.formatted || c.fallbackName;
+      const baseAmt = alloc[c.allocKey] || 0;
+      const isPerPlate = c.perPlate;
+      const guests = Math.max(1, Number(guestCount) || 1);
+      let pMin = 0;
+      let pMax = 0;
+      if (isPerPlate) {
+        const perPlate = Math.max(200, Math.round(baseAmt / guests));
+        pMin = Math.round(perPlate * 0.9) * guests;
+        pMax = Math.round(perPlate * 1.2) * guests;
+      } else {
+        pMin = Math.max(1000, Math.round(baseAmt * 0.85));
+        pMax = Math.max(pMin, Math.round(baseAmt * 1.2));
+      }
 
-    return {
-      category: c.category,
-      name: displayName,
-      priceRange: budgetBasedRange(alloc[c.allocKey] || 0, guestCount, c.perPlate),
-      rating: 4.0,
-      notes: place.formatted || `${location || 'India'} (Geoapify)`,
-      lat: Number(place.lat),
-      lon: Number(place.lon),
-      mapUrl: place.datasource?.raw?.website || (Number.isFinite(Number(place.lat)) && Number.isFinite(Number(place.lon))
-        ? `https://www.openstreetmap.org/?mlat=${Number(place.lat)}&mlon=${Number(place.lon)}#map=16/${Number(place.lat)}/${Number(place.lon)}`
-        : null)
-    };
+      return {
+        category: c.category,
+        name: displayName,
+        priceRange: budgetBasedRange(baseAmt, guestCount, isPerPlate),
+        priceMin: pMin,
+        priceMax: pMax,
+        rating: 4.0,
+        notes: place.formatted || `${location || 'India'} (Geoapify)`,
+        lat: Number(place.lat),
+        lon: Number(place.lon),
+        mapUrl: place.datasource?.raw?.website || (Number.isFinite(Number(place.lat)) && Number.isFinite(Number(place.lon))
+          ? `https://www.openstreetmap.org/?mlat=${Number(place.lat)}&mlon=${Number(place.lon)}#map=16/${Number(place.lat)}/${Number(place.lon)}`
+          : null)
+      };
+    } catch (e) {
+      console.warn(`fetchGeoapifyVendors failed for ${c.category}:`, e.message);
+      return null;
+    }
   });
 
   return (await Promise.all(calls)).filter(Boolean);
@@ -342,11 +604,34 @@ function normalizeVendorId(str) {
 function categoryLabelFromGeoapifyCats(cats = []) {
   const list = Array.isArray(cats) ? cats : [];
   const has = (s) => list.some((c) => String(c).includes(s));
-  if (has('commercial.photo') || has('photo_studio')) return 'Photography';
+  if (has('commercial.photo') || has('photo_studio') || has('photographer')) return 'Photography';
   if (has('commercial.florist') || has('florist') || has('craft.florist')) return 'Decoration';
+  if (has('events_venue') || has('accommodation') || has('hotel')) return 'Venue';
   if (has('catering') || has('restaurant') || has('food')) return 'Catering';
   if (has('entertainment') || has('theatre') || has('cinema') || has('nightclub') || has('music')) return 'Entertainment';
   return 'Other';
+}
+
+function getDefaultCategoryPrice(category, priceLevel) {
+  let multiplier = 1.0;
+  if (priceLevel === 1 || String(priceLevel).includes('INEXPENSIVE') || String(priceLevel) === '1') multiplier = 0.6;
+  else if (priceLevel === 3 || String(priceLevel).includes('EXPENSIVE') || String(priceLevel) === '3') multiplier = 1.5;
+  else if (priceLevel === 4 || String(priceLevel).includes('VERY_EXPENSIVE') || String(priceLevel) === '4') multiplier = 2.5;
+
+  const defaults = {
+    'Venue': { min: 40000, max: 200000 },
+    'Catering': { min: 25000, max: 120000 },
+    'Photography': { min: 15000, max: 75000 },
+    'Decoration': { min: 10000, max: 50000 },
+    'Entertainment': { min: 8000, max: 40000 },
+    'Other': { min: 5000, max: 25000 }
+  };
+
+  const val = defaults[category] || defaults['Other'];
+  return {
+    priceMin: Math.round(val.min * multiplier),
+    priceMax: Math.round(val.max * multiplier)
+  };
 }
 
 async function fetchGeoapifyVendorList({ location, limit = 36 }) {
@@ -359,52 +644,64 @@ async function fetchGeoapifyVendorList({ location, limit = 36 }) {
     'catering',
     'catering.restaurant',
     'catering.fast_food',
-    'commercial.photo_studio',
+    'service.photographer',
+    'commercial.hobby.photo',
     'commercial.florist',
     'entertainment',
+    'activity.events_venue',
+    'accommodation.hotel',
   ];
 
-  const url = `https://api.geoapify.com/v2/places?categories=${encodeURIComponent(categories.join(','))}&filter=circle:${center.lon},${center.lat},15000&bias=proximity:${center.lon},${center.lat}&limit=${Math.min(60, Math.max(10, limit))}&apiKey=${GEOAPIFY_API_KEY}`;
-  const resp = await fetch(url);
-  if (!resp.ok) return [];
-  const data = await resp.json();
-  const features = Array.isArray(data?.features) ? data.features : [];
+  try {
+    const catParam = categories.join(','); // Geoapify requires raw commas, not %2C
+    const url = `https://api.geoapify.com/v2/places?categories=${catParam}&filter=circle:${center.lon},${center.lat},15000&bias=proximity:${center.lon},${center.lat}&limit=${Math.min(60, Math.max(10, limit))}&apiKey=${GEOAPIFY_API_KEY}`;
+    const resp = await fetchWithRetryAndTimeout(url);
+    const data = await resp.json();
+    const features = Array.isArray(data?.features) ? data.features : [];
 
-  const out = features.map((f) => {
-    const p = f?.properties || {};
-    const name = p.name || p.formatted || 'Vendor';
-    const lat = Number(p.lat);
-    const lon = Number(p.lon);
-    const category = categoryLabelFromGeoapifyCats(p.categories || []);
-    const id = `geoapify-${normalizeVendorId(name)}-${normalizeVendorId(category)}-${normalizeVendorId(String(p.place_id || ''))}`;
-    return {
-      id,
-      category,
-      organization: name,
-      rating: typeof p.rank?.popularity === 'number' ? Math.min(5, Math.max(3.5, 3.5 + (p.rank.popularity / 100))) : 4.0,
-      location: location || p.city || p.state || '',
-      address: p.formatted || '',
-      priceLevel: p.datasource?.raw?.price_level || null,
-      services: (Array.isArray(p.categories) ? p.categories.slice(0, 3).join(', ') : ''),
-      lat: Number.isFinite(lat) ? lat : null,
-      lon: Number.isFinite(lon) ? lon : null,
-      mapUrl: Number.isFinite(lat) && Number.isFinite(lon)
-        ? `https://www.openstreetmap.org/?mlat=${lat}&mlon=${lon}#map=16/${lat}/${lon}`
-        : null
-    };
-  });
+    const out = features.map((f) => {
+      const p = f?.properties || {};
+      const name = p.name || p.formatted || 'Vendor';
+      const lat = Number(p.lat);
+      const lon = Number(p.lon);
+      const category = categoryLabelFromGeoapifyCats(p.categories || []);
+      const id = `geoapify-${normalizeVendorId(name)}-${normalizeVendorId(category)}-${normalizeVendorId(String(p.place_id || ''))}`;
+      const prices = getDefaultCategoryPrice(category, p.datasource?.raw?.price_level);
+      return {
+        id,
+        category,
+        organization: name,
+        rating: typeof p.rank?.popularity === 'number' ? Math.min(5, Math.max(3.5, 3.5 + (p.rank.popularity / 100))) : 4.0,
+        location: location || p.city || p.state || '',
+        address: p.formatted || '',
+        priceLevel: p.datasource?.raw?.price_level || null,
+        priceMin: prices.priceMin,
+        priceMax: prices.priceMax,
+        priceRange: `₹${prices.priceMin.toLocaleString('en-IN')} - ₹${prices.priceMax.toLocaleString('en-IN')}`,
+        services: (Array.isArray(p.categories) ? p.categories.slice(0, 3).join(', ') : ''),
+        lat: Number.isFinite(lat) ? lat : null,
+        lon: Number.isFinite(lon) ? lon : null,
+        mapUrl: Number.isFinite(lat) && Number.isFinite(lon)
+          ? `https://www.openstreetmap.org/?mlat=${lat}&mlon=${lon}#map=16/${lat}/${lon}`
+          : null
+      };
+    });
 
-  // Dedupe by org+category
-  const seen = new Set();
-  const deduped = [];
-  for (const v of out) {
-    const key = `${v.organization}|${v.category}`.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    deduped.push(v);
-    if (deduped.length >= limit) break;
+    // Dedupe by org+category
+    const seen = new Set();
+    const deduped = [];
+    for (const v of out) {
+      const key = `${v.organization}|${v.category}`.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      deduped.push(v);
+      if (deduped.length >= limit) break;
+    }
+    return deduped;
+  } catch (e) {
+    console.warn('fetchGeoapifyVendorList failed:', e.message);
+    return [];
   }
-  return deduped;
 }
 
 async function fetchGooglePlacesVendorList({ location, limit = 36 }) {
@@ -419,31 +716,41 @@ async function fetchGooglePlacesVendorList({ location, limit = 36 }) {
   const perQuery = Math.max(5, Math.floor(limit / queries.length));
 
   const calls = queries.map(async ({ category, q }) => {
-    const resp = await fetch('https://places.googleapis.com/v1/places:searchText', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Goog-Api-Key': GOOGLE_PLACES_API_KEY,
-        'X-Goog-FieldMask': 'places.id,places.displayName,places.formattedAddress,places.rating,places.userRatingCount,places.priceLevel,places.location,places.googleMapsUri'
-      },
-      body: JSON.stringify({ textQuery: q, maxResultCount: perQuery })
-    });
-    if (!resp.ok) return [];
-    const data = await resp.json();
-    const places = Array.isArray(data.places) ? data.places : [];
-    return places.map((p) => ({
-      id: `gplaces-${p.id}`,
-      category,
-      organization: p.displayName?.text || 'Vendor',
-      rating: Number(p.rating || 4.0),
-      location: location || '',
-      address: p.formattedAddress || '',
-      priceLevel: p.priceLevel || null,
-      services: p.userRatingCount ? `${p.userRatingCount} reviews` : '',
-      lat: Number(p.location?.latitude),
-      lon: Number(p.location?.longitude),
-      mapUrl: p.googleMapsUri || null
-    }));
+    try {
+      const resp = await fetchWithRetryAndTimeout('https://places.googleapis.com/v1/places:searchText', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Goog-Api-Key': GOOGLE_PLACES_API_KEY,
+          'X-Goog-FieldMask': 'places.id,places.displayName,places.formattedAddress,places.rating,places.userRatingCount,places.priceLevel,places.location,places.googleMapsUri'
+        },
+        body: JSON.stringify({ textQuery: q, maxResultCount: perQuery })
+      });
+      const data = await resp.json();
+      const places = Array.isArray(data.places) ? data.places : [];
+      return places.map((p) => {
+        const prices = getDefaultCategoryPrice(category, p.priceLevel);
+        return {
+          id: `gplaces-${p.id}`,
+          category,
+          organization: p.displayName?.text || 'Vendor',
+          rating: Number(p.rating || 4.0),
+          location: location || '',
+          address: p.formattedAddress || '',
+          priceLevel: p.priceLevel || null,
+          priceMin: prices.priceMin,
+          priceMax: prices.priceMax,
+          priceRange: `₹${prices.priceMin.toLocaleString('en-IN')} - ₹${prices.priceMax.toLocaleString('en-IN')}`,
+          services: p.userRatingCount ? `${p.userRatingCount} reviews` : '',
+          lat: Number(p.location?.latitude),
+          lon: Number(p.location?.longitude),
+          mapUrl: p.googleMapsUri || null
+        };
+      });
+    } catch (e) {
+      console.warn(`fetchGooglePlacesVendorList failed for ${category}:`, e.message);
+      return [];
+    }
   });
 
   const merged = (await Promise.all(calls)).flat();
@@ -461,21 +768,155 @@ async function fetchGooglePlacesVendorList({ location, limit = 36 }) {
 
 async function fetchLiveVendorList({ location, limit = 36 }) {
   if (!location) return [];
-  try {
-    const geo = await fetchGeoapifyVendorList({ location, limit });
-    if (geo.length) return geo;
-  } catch (e) {
-    console.warn('Geoapify vendor list failed:', e.message);
+  const cacheKey = `${location.toLowerCase()}-${limit}`;
+  const cached = vendorSearchCache.get(cacheKey);
+  if (cached && (Date.now() - cached.timestamp < CACHE_TTL)) {
+    console.log(`📦 Serving live vendor list from cache for: ${location}`);
+    return cached.data;
   }
-  try {
-    const gp = await fetchGooglePlacesVendorList({ location, limit });
-    if (gp.length) return gp;
-  } catch (e) {
-    console.warn('Google vendor list failed:', e.message);
+
+  const fetchResults = async () => {
+    // 1) Try Geoapify (best for India)
+    if (GEOAPIFY_API_KEY) {
+      try {
+        const geo = await fetchGeoapifyVendorList({ location, limit });
+        if (geo.length) { console.log(`✅ Geoapify returned ${geo.length} vendors`); return geo; }
+      } catch (e) {
+        console.warn('Geoapify vendor list failed:', e.message);
+      }
+    }
+    // 2) Try Google Places
+    if (GOOGLE_PLACES_API_KEY) {
+      try {
+        const gp = await fetchGooglePlacesVendorList({ location, limit });
+        if (gp.length) { console.log(`✅ Google Places returned ${gp.length} vendors`); return gp; }
+      } catch (e) {
+        console.warn('Google vendor list failed:', e.message);
+      }
+    }
+    // 3) Try Overpass OSM (free, no key needed)
+    try {
+      const osmVendors = await fetchOverpassVendorList({ location, limit });
+      if (osmVendors.length) { console.log(`✅ Overpass OSM returned ${osmVendors.length} vendors`); return osmVendors; }
+    } catch (e) {
+      console.warn('Overpass vendor list failed:', e.message);
+    }
+    // 4) Offline curated vendor list based on city
+    console.log(`⚠️ All APIs failed, generating offline vendors for ${location}`);
+    return generateOfflineVendorList({ location, limit });
+  };
+
+  const results = await fetchResults();
+  if (results.length) {
+    vendorSearchCache.set(cacheKey, { data: results, timestamp: Date.now() });
   }
-  // As a last resort, return empty (OSM Overpass broad search is expensive and rate-limited).
-  return [];
+  return results;
 }
+
+// ─── Overpass Vendor List (no API key required) ────────────────────────────────
+async function fetchOverpassVendorList({ location, limit = 36 }) {
+  const center = await geocodeLocation(location);
+  if (!center) return [];
+
+  const osmCategories = [
+    { category: 'Venue', tags: ['[\"amenity\"=\"events_venue\"]', '[\"amenity\"=\"banquet_hall\"]', '[\"leisure\"=\"event_venue\"]'] },
+    { category: 'Catering', tags: ['[\"amenity\"=\"restaurant\"]', '[\"amenity\"=\"catering\"]'] },
+    { category: 'Photography', tags: ['[\"shop\"=\"photo\"]', '[\"shop\"=\"photography\"]', '[\"craft\"=\"photographer\"]'] },
+    { category: 'Decoration', tags: ['[\"shop\"=\"florist\"]', '[\"shop\"=\"party\"]', '[\"shop\"=\"event\"]'] },
+    { category: 'Entertainment', tags: ['[\"amenity\"=\"nightclub\"]', '[\"amenity\"=\"music_venue\"]', '[\"leisure\"=\"dance\"]'] },
+  ];
+
+  const calls = osmCategories.map(async (c) => {
+    const unionParts = c.tags.flatMap(tag => [
+      `node${tag}(around:15000,${center.lat},${center.lon});`,
+      `way${tag}(around:15000,${center.lat},${center.lon});`,
+    ]).join('\n        ');
+
+    const query = `[out:json][timeout:20];\n(\n${unionParts}\n);\nout center tags 10;`;
+    try {
+      const resp = await fetchWithRetryAndTimeout('https://overpass-api.de/api/interpreter', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: `data=${encodeURIComponent(query)}`
+      }, 2, 22000);
+      const data = await resp.json();
+      const elements = (data.elements || []).filter(e => e.tags?.name);
+      return elements.slice(0, Math.ceil(limit / osmCategories.length)).map((e) => {
+        const lat = Number(e.lat ?? e.center?.lat);
+        const lon = Number(e.lon ?? e.center?.lon);
+        const prices = getDefaultCategoryPrice(c.category, null);
+        return {
+          id: `osm-${e.type}-${e.id}`,
+          category: c.category,
+          organization: e.tags.name,
+          rating: 4.0,
+          location: location || '',
+          address: e.tags['addr:full'] || e.tags['addr:street'] || `${location}, India`,
+          priceMin: prices.priceMin,
+          priceMax: prices.priceMax,
+          priceRange: `₹${prices.priceMin.toLocaleString('en-IN')} - ₹${prices.priceMax.toLocaleString('en-IN')}`,
+          services: `${c.category} service`,
+          lat: Number.isFinite(lat) ? lat : null,
+          lon: Number.isFinite(lon) ? lon : null,
+          mapUrl: Number.isFinite(lat) && Number.isFinite(lon)
+            ? `https://www.openstreetmap.org/?mlat=${lat}&mlon=${lon}#map=16/${lat}/${lon}`
+            : null
+        };
+      });
+    } catch (e) {
+      console.warn(`Overpass list failed for ${c.category}:`, e.message);
+      return [];
+    }
+  });
+
+  const merged = (await Promise.all(calls)).flat();
+  const seen = new Set();
+  const out = [];
+  for (const v of merged) {
+    const key = `${v.organization}|${v.category}`.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(v);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+// ─── Offline Vendor List Generator (curated, realistic Indian vendors) ─────────
+function generateOfflineVendorList({ location, limit = 36 }) {
+  const city = location || 'India';
+  const templates = [
+    { category: 'Venue', names: [`${city} Grand Banquet`, `Royal Palace ${city}`, `${city} Convention Center`, `The Ritz ${city}`, `${city} Event Suites`], priceMin: 80000, priceMax: 250000 },
+    { category: 'Catering', names: [`${city} Catering Co.`, `Royal Feast ${city}`, `Spice Garden Caterers`, `${city} Food Hub`, `Premium Caterers ${city}`], priceMin: 15000, priceMax: 80000 },
+    { category: 'Photography', names: [`${city} Studio`, `Moments by Priya`, `Lens & Light ${city}`, `${city} Photographers`, `Clickstudio ${city}`], priceMin: 20000, priceMax: 80000 },
+    { category: 'Decoration', names: [`${city} Decors`, `Floral Fantasy ${city}`, `Dream Setup ${city}`, `${city} Event Decor`, `Bloom & Style`], priceMin: 15000, priceMax: 60000 },
+    { category: 'Entertainment', names: [`${city} DJ Services`, `Live Band ${city}`, `Magic Show ${city}`, `${city} Entertainment`, `Star Performers`], priceMin: 10000, priceMax: 50000 },
+  ];
+
+  const vendors = [];
+  for (const t of templates) {
+    for (let i = 0; i < t.names.length && vendors.length < limit; i++) {
+      vendors.push({
+        id: `offline-${t.category.toLowerCase()}-${i}`,
+        category: t.category,
+        organization: t.names[i],
+        rating: (4.0 + Math.random() * 0.9).toFixed(1) * 1,
+        location: city,
+        address: `${city}, India`,
+        priceMin: t.priceMin,
+        priceMax: t.priceMax,
+        priceRange: `₹${t.priceMin.toLocaleString('en-IN')} - ₹${t.priceMax.toLocaleString('en-IN')}`,
+        services: `${t.category} service in ${city}`,
+        lat: null,
+        lon: null,
+        mapUrl: null,
+        isOffline: true
+      });
+    }
+  }
+  return vendors;
+}
+
 
 async function fetchGooglePlacesVendors({ location, budgetBreakdown, guestCount }) {
   if (!GOOGLE_PLACES_API_KEY) return [];
@@ -504,37 +945,56 @@ async function fetchGooglePlacesVendors({ location, budgetBreakdown, guestCount 
           }
         : {})
     };
-    const resp = await fetch('https://places.googleapis.com/v1/places:searchText', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Goog-Api-Key': GOOGLE_PLACES_API_KEY,
-        'X-Goog-FieldMask': 'places.displayName,places.formattedAddress,places.rating,places.userRatingCount,places.priceLevel,places.location,places.googleMapsUri'
-      },
-      body: JSON.stringify(body)
-    });
-    if (!resp.ok) return null;
-    const data = await resp.json();
-    const place = Array.isArray(data.places) ? data.places[0] : null;
-    if (!place?.displayName?.text) return null;
+    try {
+      const resp = await fetchWithRetryAndTimeout('https://places.googleapis.com/v1/places:searchText', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Goog-Api-Key': GOOGLE_PLACES_API_KEY,
+          'X-Goog-FieldMask': 'places.displayName,places.formattedAddress,places.rating,places.userRatingCount,places.priceLevel,places.location,places.googleMapsUri'
+        },
+        body: JSON.stringify(body)
+      });
+      const data = await resp.json();
+      const place = Array.isArray(data.places) ? data.places[0] : null;
+      if (!place?.displayName?.text) return null;
 
-    const priceMultiplier =
-      place.priceLevel === 'PRICE_LEVEL_EXPENSIVE' ? 1.2 :
-      place.priceLevel === 'PRICE_LEVEL_VERY_EXPENSIVE' ? 1.35 :
-      place.priceLevel === 'PRICE_LEVEL_INEXPENSIVE' ? 0.85 :
-      place.priceLevel === 'PRICE_LEVEL_MODERATE' ? 1.0 :
-      1.0;
-    const baseAmount = (alloc[c.allocKey] || 0) * priceMultiplier;
-    return {
-      category: c.category,
-      name: place.displayName.text,
-      priceRange: budgetBasedRange(baseAmount, guestCount, c.perPlate),
-      rating: Number(place.rating || 4.0),
-      notes: place.formattedAddress || `${location || 'India'} (Google Places)`,
-      lat: Number(place.location?.latitude),
-      lon: Number(place.location?.longitude),
-      mapUrl: place.googleMapsUri || null
-    };
+      const priceMultiplier =
+        place.priceLevel === 'PRICE_LEVEL_EXPENSIVE' ? 1.2 :
+        place.priceLevel === 'PRICE_LEVEL_VERY_EXPENSIVE' ? 1.35 :
+        place.priceLevel === 'PRICE_LEVEL_INEXPENSIVE' ? 0.85 :
+        place.priceLevel === 'PRICE_LEVEL_MODERATE' ? 1.0 :
+        1.0;
+      const baseAmount = (alloc[c.allocKey] || 0) * priceMultiplier;
+      const isPerPlate = c.perPlate;
+      const guests = Math.max(1, Number(guestCount) || 1);
+      let pMin = 0;
+      let pMax = 0;
+      if (isPerPlate) {
+        const perPlate = Math.max(200, Math.round(baseAmount / guests));
+        pMin = Math.round(perPlate * 0.9) * guests;
+        pMax = Math.round(perPlate * 1.2) * guests;
+      } else {
+        pMin = Math.max(1000, Math.round(baseAmount * 0.85));
+        pMax = Math.max(pMin, Math.round(baseAmount * 1.2));
+      }
+
+      return {
+        category: c.category,
+        name: place.displayName.text,
+        priceRange: budgetBasedRange(baseAmount, guestCount, c.perPlate),
+        priceMin: pMin,
+        priceMax: pMax,
+        rating: Number(place.rating || 4.0),
+        notes: place.formattedAddress || `${location || 'India'} (Google Places)`,
+        lat: Number(place.location?.latitude),
+        lon: Number(place.location?.longitude),
+        mapUrl: place.googleMapsUri || null
+      };
+    } catch (e) {
+      console.warn(`fetchGooglePlacesVendors failed for ${c.category}:`, e.message);
+      return null;
+    }
   });
   const vendors = (await Promise.all(calls)).filter(Boolean);
   return vendors;
@@ -562,27 +1022,47 @@ async function fetchOverpassVendors({ location, budgetBreakdown, guestCount }) {
       );
       out center tags 5;
     `;
-    const resp = await fetch('https://overpass-api.de/api/interpreter', {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain' },
-      body: query
-    });
-    if (!resp.ok) return null;
-    const data = await resp.json();
-    const firstWithName = (data.elements || []).find((e) => e.tags?.name);
-    if (!firstWithName?.tags?.name) return null;
-    return {
-      category: c.category,
-      name: firstWithName.tags.name,
-      priceRange: budgetBasedRange(alloc[c.allocKey] || 0, guestCount, c.perPlate),
-      rating: 4.0,
-      notes: firstWithName.tags['addr:full'] || firstWithName.tags['addr:street'] || `${location || 'India'} (OpenStreetMap)`,
-      lat: Number(firstWithName.lat ?? firstWithName.center?.lat),
-      lon: Number(firstWithName.lon ?? firstWithName.center?.lon),
-      mapUrl: Number.isFinite(Number(firstWithName.lat ?? firstWithName.center?.lat)) && Number.isFinite(Number(firstWithName.lon ?? firstWithName.center?.lon))
-        ? `https://www.openstreetmap.org/?mlat=${Number(firstWithName.lat ?? firstWithName.center?.lat)}&mlon=${Number(firstWithName.lon ?? firstWithName.center?.lon)}#map=16/${Number(firstWithName.lat ?? firstWithName.center?.lat)}/${Number(firstWithName.lon ?? firstWithName.center?.lon)}`
-        : null
-    };
+    try {
+      const resp = await fetchWithRetryAndTimeout('https://overpass-api.de/api/interpreter', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: `data=${encodeURIComponent(query)}`
+      }, 2, 20000);
+      const data = await resp.json();
+      const firstWithName = (data.elements || []).find((e) => e.tags?.name);
+      if (!firstWithName?.tags?.name) return null;
+      const baseAmt = alloc[c.allocKey] || 0;
+      const isPerPlate = c.perPlate;
+      const guests = Math.max(1, Number(guestCount) || 1);
+      let pMin = 0;
+      let pMax = 0;
+      if (isPerPlate) {
+        const perPlate = Math.max(200, Math.round(baseAmt / guests));
+        pMin = Math.round(perPlate * 0.9) * guests;
+        pMax = Math.round(perPlate * 1.2) * guests;
+      } else {
+        pMin = Math.max(1000, Math.round(baseAmt * 0.85));
+        pMax = Math.max(pMin, Math.round(baseAmt * 1.2));
+      }
+
+      return {
+        category: c.category,
+        name: firstWithName.tags.name,
+        priceRange: budgetBasedRange(baseAmt, guestCount, c.perPlate),
+        priceMin: pMin,
+        priceMax: pMax,
+        rating: 4.0,
+        notes: firstWithName.tags['addr:full'] || firstWithName.tags['addr:street'] || `${location || 'India'} (OpenStreetMap)`,
+        lat: Number(firstWithName.lat ?? firstWithName.center?.lat),
+        lon: Number(firstWithName.lon ?? firstWithName.center?.lon),
+        mapUrl: Number.isFinite(Number(firstWithName.lat ?? firstWithName.center?.lat)) && Number.isFinite(Number(firstWithName.lon ?? firstWithName.center?.lon))
+          ? `https://www.openstreetmap.org/?mlat=${Number(firstWithName.lat ?? firstWithName.center?.lat)}&mlon=${Number(firstWithName.lon ?? firstWithName.center?.lon)}#map=16/${Number(firstWithName.lat ?? firstWithName.center?.lat)}/${Number(firstWithName.lon ?? firstWithName.center?.lon)}`
+          : null
+      };
+    } catch (e) {
+      console.warn(`fetchOverpassVendors failed for ${c.category}:`, e.message);
+      return null;
+    }
   });
 
   const vendors = (await Promise.all(calls)).filter(Boolean);
@@ -590,25 +1070,32 @@ async function fetchOverpassVendors({ location, budgetBreakdown, guestCount }) {
 }
 
 async function fetchLocationRealVendors({ location, budgetBreakdown, guestCount }) {
+  let list = [];
   try {
     const geoapifyVendors = await fetchGeoapifyVendors({ location, budgetBreakdown, guestCount });
-    if (geoapifyVendors.length) return geoapifyVendors;
+    if (geoapifyVendors.length) list = geoapifyVendors;
   } catch (e) {
     console.warn('Geoapify lookup failed:', e.message);
   }
-  try {
-    const googleVendors = await fetchGooglePlacesVendors({ location, budgetBreakdown, guestCount });
-    if (googleVendors.length) return googleVendors;
-  } catch (e) {
-    console.warn('Google Places lookup failed:', e.message);
+  if (!list.length) {
+    try {
+      const googleVendors = await fetchGooglePlacesVendors({ location, budgetBreakdown, guestCount });
+      if (googleVendors.length) list = googleVendors;
+    } catch (e) {
+      console.warn('Google Places lookup failed:', e.message);
+    }
   }
-  try {
-    const osmVendors = await fetchOverpassVendors({ location, budgetBreakdown, guestCount });
-    if (osmVendors.length) return osmVendors;
-  } catch (e) {
-    console.warn('Overpass lookup failed:', e.message);
+  if (!list.length) {
+    try {
+      const osmVendors = await fetchOverpassVendors({ location, budgetBreakdown, guestCount });
+      if (osmVendors.length) list = osmVendors;
+    } catch (e) {
+      console.warn('Overpass lookup failed:', e.message);
+    }
   }
-  return [];
+  
+  // Score and rank vendor recommendations
+  return rankVendors(list, budgetBreakdown, guestCount);
 }
 
 function buildBestOptionsFromVendors({ vendors, budgetBreakdown, guestCount }) {
@@ -799,6 +1286,8 @@ function enrichVendorsWithNotionPricing(vendors, notionVendors) {
         ...v,
         name: v?.name || match.organization,
         priceRange: `₹${Number(match.priceMin || 0).toLocaleString('en-IN')} - ₹${Number(match.priceMax || 0).toLocaleString('en-IN')}`,
+        priceMin: Number(match.priceMin || 0),
+        priceMax: Number(match.priceMax || 0),
         priceSource: 'notion',
         notionVendorId: match.notionId || match.id,
       };
@@ -806,8 +1295,10 @@ function enrichVendorsWithNotionPricing(vendors, notionVendors) {
 
     return {
       ...v,
-      priceRange: 'Request quote',
-      priceSource: 'unknown',
+      priceMin: Number(v.priceMin || 0),
+      priceMax: Number(v.priceMax || 0),
+      priceRange: v.priceRange || 'Request quote',
+      priceSource: v.priceRange ? 'api' : 'unknown',
     };
   });
 }
@@ -822,7 +1313,7 @@ const nToday   = ()  => ({ date: { start: new Date().toISOString().slice(0, 10) 
 
 
 // ─── /api/generate-plan ──────────────────────────────────────────────────────
-app.post('/api/generate-plan', async (req, res) => {
+app.post('/api/generate-plan', rateLimiter, async (req, res) => {
   try {
     const {
       name, type, date, guestCount, location, budgetMin, budgetMax, description,
@@ -935,9 +1426,13 @@ Rules:
     if (realVendors.length) {
       parsed.vendors = realVendors;
     } else {
-      parsed.vendors = [];
+      // Fallback: generate curated offline vendors for the city
+      const offlineVendors = generateOfflineVendorList({ location: location || 'India', limit: 10 });
+      parsed.vendors = offlineVendors;
       parsed.tips = Array.isArray(parsed.tips) ? parsed.tips : [];
-      parsed.tips.unshift('Could not fetch live vendors for this location right now. Try a nearby city name or add GEOAPIFY_API_KEY / GOOGLE_PLACES_API_KEY for richer results.');
+      if (!GEOAPIFY_API_KEY && !GOOGLE_PLACES_API_KEY) {
+        parsed.tips.unshift('💡 Add GEOAPIFY_API_KEY to your .env for real live vendors with maps in your city.');
+      }
     }
 
     // Pricing policy (Option A): show prices ONLY if vendor exists in Notion.
@@ -949,7 +1444,13 @@ Rules:
       const notionVendors = notionData?.results ? notionData.results.map(mapNotionVendor) : [];
       parsed.vendors = enrichVendorsWithNotionPricing(parsed.vendors || [], notionVendors);
     } else {
-      parsed.vendors = (parsed.vendors || []).map((v) => ({ ...v, priceRange: 'Request quote', priceSource: 'unknown' }));
+      parsed.vendors = (parsed.vendors || []).map((v) => ({
+        ...v,
+        priceMin: Number(v.priceMin || 0),
+        priceMax: Number(v.priceMax || 0),
+        priceRange: v.priceRange || 'Request quote',
+        priceSource: v.priceRange ? 'api' : 'unknown'
+      }));
     }
 
     if (!parsed.estimatedCost) {
@@ -970,18 +1471,19 @@ Rules:
     }
 
     // ── Sync to Notion (non-blocking) ──
-    notionInsert(NOTION_DB_EVENTS, {
-      'Name':        nTitle(name),
-      'Type':        nText(type),
-      'Date':        nDate(date),
-      'Guests':      nNumber(guestCount),
-      'Location':    nText(location),
-      'Budget Min':  nNumber(budgetMin),
-      'Budget Max':  nNumber(budgetMax),
-      'Description': nText(description),
-      'Created At':  nToday(),
-    }).then(() => console.log(`✅ Notion: event "${name}" saved`))
-      .catch(e  => console.error('Notion event save failed:', e.message));
+    notionUpsertEvent(name, {
+      'Name':           nTitle(name),
+      'Type':           nText(type),
+      'Date':           nDate(date),
+      'Guests':         nNumber(guestCount),
+      'Location':       nText(location),
+      'Budget Min':     nNumber(budgetMin),
+      'Budget Max':     nNumber(budgetMax),
+      'Description':    nText(description),
+      'Generated Plan': nText(JSON.stringify(parsed)),
+      'Created At':     nToday(),
+    }).then(() => console.log(`✅ Notion: event "${name}" synced`))
+      .catch(e  => console.error('Notion event sync failed:', e.message));
 
     store.setEvent({ name, type, date, guestCount, location, budgetMin, budgetMax, description, id: req.body.id || `evt-${Date.now()}` });
     store.setAiResults(parsed);
@@ -1060,7 +1562,10 @@ app.get('/api/vendors', async (req, res) => {
     if (!location) return res.json(store.listVendors());
     const limit = Math.min(60, Math.max(12, Number(req.query.limit || 36)));
     const vendors = await fetchLiveVendorList({ location, limit });
-    return res.json({ vendors, source: vendors.length ? 'live' : 'none' });
+    const source = vendors.length
+      ? (vendors[0].id?.startsWith('offline-') ? 'offline' : vendors[0].id?.startsWith('osm-') ? 'osm' : 'live')
+      : 'none';
+    return res.json({ vendors, source });
   } catch (err) {
     console.error('vendors endpoint error:', err.message);
     res.status(500).json({ error: 'Failed to fetch vendors', details: err.message });
@@ -1269,7 +1774,7 @@ app.post('/api/notion/save-vendor', async (req, res) => {
     const { organization, category, location, priceMin, priceMax, services, contact, rating } = req.body;
     if (!organization) return res.status(400).json({ error: 'organization required' });
 
-    const result = await notionInsert(NOTION_DB_VENDORS, {
+    const result = await notionUpsertVendor(organization, {
       'Organization': nTitle(organization),
       'Category':     nSelect(category),
       'Location':     nText(location),
@@ -1281,8 +1786,8 @@ app.post('/api/notion/save-vendor', async (req, res) => {
       'Saved At':     nToday(),
     });
 
-    if (!result) return res.status(503).json({ error: 'Notion not configured or insert failed' });
-    console.log(`✅ Notion: vendor "${organization}" saved`);
+    if (!result) return res.status(503).json({ error: 'Notion not configured or upsert failed' });
+    console.log(`✅ Notion: vendor "${organization}" saved/updated`);
     res.json({ success: true, pageId: result.id });
   } catch (err) {
     console.error('notion/save-vendor error:', err.message);
@@ -1345,7 +1850,7 @@ app.post('/api/notion/save-booking', async (req, res) => {
     const { eventName, vendorName, date, budget, status } = req.body;
     if (!eventName) return res.status(400).json({ error: 'eventName required' });
 
-    const result = await notionInsert(NOTION_DB_BOOKINGS, {
+    const result = await notionUpsertBooking(eventName, vendorName, {
       'Event Name':   nTitle(eventName),
       'Vendor':       nText(vendorName),
       'Event Date':   nDate(date),
@@ -1354,8 +1859,8 @@ app.post('/api/notion/save-booking', async (req, res) => {
       'Requested At': nToday(),
     });
 
-    if (!result) return res.status(503).json({ error: 'Notion not configured or insert failed' });
-    console.log(`✅ Notion: booking for "${eventName}" saved`);
+    if (!result) return res.status(503).json({ error: 'Notion not configured or upsert failed' });
+    console.log(`✅ Notion: booking for "${eventName}" saved/updated`);
     res.json({ success: true, pageId: result.id });
   } catch (err) {
     console.error('notion/save-booking error:', err.message);
@@ -1459,20 +1964,49 @@ app.delete('/api/attendees/:id', (req, res) => {
   res.json({ success: true });
 });
 
-app.post('/api/attendees/remind', (req, res) => {
+app.post('/api/attendees/remind', async (req, res) => {
   const { id, bulk } = req.body;
   const attendees = store.listAttendees();
+  const event = store.getAll().event || {};
+  const eventName = event.name || 'Your Event';
+  
   if (bulk) {
     const invited = attendees.filter(a => a.status === 'Invited');
+    let sentCount = 0;
+    for (const a of invited) {
+      try {
+        const text = `Hi ${a.name},\n\nThis is a friendly reminder to RSVP for "${eventName}" scheduled on ${event.date || 'TBD'} at ${event.location || 'TBD'}.\n\nPlease let us know if you can make it.\n\nBest regards,\nEvent Planner`;
+        await sendEmail({
+          to: a.email,
+          subject: `Reminder: RSVP for ${eventName}`,
+          text
+        });
+        sentCount++;
+      } catch (err) {
+        console.error(`Failed to send reminder to ${a.email}:`, err.message);
+      }
+    }
     return res.json({
       success: true,
-      count: invited.length,
-      message: `Reminders queued for ${invited.length} invited attendee(s)`,
+      count: sentCount,
+      message: `Reminders sent to ${sentCount} invited attendee(s)`,
     });
   }
   const att = attendees.find(a => a.id === id);
   if (!att) return res.status(404).json({ error: 'Attendee not found' });
-  res.json({ success: true, message: `Reminder sent to ${att.name} at ${att.email}` });
+  
+  try {
+    const text = `Hi ${att.name},\n\nThis is a friendly reminder to RSVP for "${eventName}" scheduled on ${event.date || 'TBD'} at ${event.location || 'TBD'}.\n\nPlease let us know if you can make it.\n\nBest regards,\nEvent Planner`;
+    await sendEmail({
+      to: att.email,
+      subject: `Reminder: RSVP for ${eventName}`,
+      text
+    });
+    res.json({ success: true, message: `Reminder sent to ${att.name} at ${att.email}` });
+  } catch (err) {
+    console.error(`Failed to send reminder to ${att.email}:`, err.message);
+    res.status(500).json({ error: `Failed to send email: ${err.message}` });
+  }
 });
 
 app.post('/api/attendees/invite-preview', (req, res) => {
@@ -1482,9 +2016,26 @@ app.post('/api/attendees/invite-preview', (req, res) => {
   res.json({ preview });
 });
 
-app.post('/api/attendees/send-invites', (req, res) => {
-  const count = store.listAttendees().filter(a => a.status === 'Invited').length;
-  res.json({ success: true, count, message: `Invitations sent to ${count} pending attendee(s)` });
+app.post('/api/attendees/send-invites', async (req, res) => {
+  const attendees = store.listAttendees().filter(a => a.status === 'Invited');
+  const event = store.getAll().event || {};
+  const eventName = event.name || 'Your Event';
+  
+  let sentCount = 0;
+  for (const a of attendees) {
+    try {
+      const text = `💌 You're Invited!\n\nHi ${a.name},\n\nJoin us for "${eventName}"!\n\n📅 Date: ${event.date || 'TBD'}\n📍 Location: ${event.location || 'TBD'}\n\nWe would love for you to join us on this special day. Please RSVP at your earliest convenience.\n\nBest regards,\nEvent Planner`;
+      await sendEmail({
+        to: a.email,
+        subject: `Invitation: ${eventName}`,
+        text
+      });
+      sentCount++;
+    } catch (err) {
+      console.error(`Failed to send invitation to ${a.email}:`, err.message);
+    }
+  }
+  res.json({ success: true, count: sentCount, message: `Invitations sent to ${sentCount} pending attendee(s)` });
 });
 
 app.get('/api/feedback', (req, res) => {
@@ -1564,8 +2115,60 @@ app.get('/api/health', (req, res) => {
   });
 });
 
+app.get('/api/clear-cache', (req, res) => {
+  vendorSearchCache.clear();
+  console.log('🧹 Live vendor cache cleared');
+  res.json({ status: 'ok', message: 'Live vendor search cache cleared successfully' });
+});
 
-app.listen(PORT, '127.0.0.1', () => {
+
+async function syncMessageToNotion(msg) {
+  if (!NOTION_TOKEN || !NOTION_DB_CHAT_LOGS) return;
+  
+  const eventName = store.getAll().event?.name || 'General Event';
+  const vendor = store.listVendors().find(v => v.id === msg.vendorId);
+  const vendorName = vendor ? vendor.organization : (msg.vendorId === 'ai-assistant' ? 'EventMind AI' : msg.vendorId);
+  
+  try {
+    await notionUpsertChatLog(msg.id, {
+      'Message ID':  nTitle(String(msg.id)),
+      'Sender':      nSelect(msg.sender === 'Vendor' ? 'Vendor' : (msg.isAI ? 'AI' : 'User')),
+      'Vendor Name': nText(vendorName),
+      'Event Name':  nText(eventName),
+      'Message':     nText(msg.text),
+      'Status':      nSelect(msg.status || 'Sent'),
+      'Timestamp':   nDate(new Date().toISOString()),
+    });
+    console.log(`✅ Notion: chat message synced`);
+  } catch (err) {
+    console.error('Notion chat sync failed:', err.message);
+  }
+}
+
+async function syncReadStatusToNotion(vendorId, senderRole) {
+  if (!NOTION_TOKEN || !NOTION_DB_CHAT_LOGS) return;
+  
+  const threadMsgs = store.listMessages(vendorId);
+  for (const m of threadMsgs) {
+    if (m.sender !== senderRole && m.status === 'read') {
+      try {
+        const queryResult = await notionQuery(NOTION_DB_CHAT_LOGS, {
+          filter: { property: 'Message ID', title: { equals: String(m.id) } }
+        });
+        const page = queryResult?.results?.[0];
+        if (page) {
+          await notionUpdate(page.id, {
+            'Status': nSelect('Read')
+          });
+        }
+      } catch (err) {
+        console.error(`Notion sync status update failed for msg ${m.id}:`, err.message);
+      }
+    }
+  }
+}
+
+const server = app.listen(PORT, '127.0.0.1', () => {
   const keyLoaded   = !!GEMINI_API_KEY && GEMINI_API_KEY !== 'your_gemini_api_key_here';
   const notionReady = !!NOTION_TOKEN && !!NOTION_DB_EVENTS;
   console.log('──────────────────────────────────────');
@@ -1574,4 +2177,97 @@ app.listen(PORT, '127.0.0.1', () => {
   console.log('  Gemini: ' + (keyLoaded ? GEMINI_API_KEY.slice(0, 8) + '...' : 'NOT LOADED ⚠'));
   console.log('  Notion: ' + (notionReady ? '✅ Connected' : '⚠  DBs not set up yet (run setup-notion.js)'));
   console.log('──────────────────────────────────────');
+});
+
+// Setup WebSocket Server bound to the same HTTP server
+const wss = new WebSocketServer({ server, path: '/api/chat-ws' });
+const chatClients = new Map(); // clientId -> ws socket
+
+function deliverPendingMessages(clientId) {
+  const ws = chatClients.get(clientId);
+  if (!ws || ws.readyState !== 1) return;
+  
+  const allMsgs = store.listMessages();
+  allMsgs.forEach(m => {
+    const isTargetUser = clientId === 'user-client' && m.sender !== 'User';
+    const isTargetVendor = clientId === m.vendorId && m.sender === 'User';
+    
+    if ((isTargetUser || isTargetVendor) && m.status === 'sent') {
+      m.status = 'delivered';
+      store.updateMessageStatus(m.id, 'delivered');
+      
+      const senderId = m.sender === 'User' ? 'user-client' : m.vendorId;
+      const senderWs = chatClients.get(senderId);
+      if (senderWs && senderWs.readyState === 1) {
+        senderWs.send(JSON.stringify({ type: 'status-update', msgId: m.id, status: 'delivered' }));
+      }
+      
+      syncMessageToNotion(m);
+      ws.send(JSON.stringify({ type: 'message', message: m }));
+    }
+  });
+}
+
+wss.on('connection', (ws) => {
+  console.log('🔌 New WS Connection established');
+  
+  ws.on('message', async (data) => {
+    try {
+      const packet = JSON.parse(data);
+      if (packet.type === 'register') {
+        ws.clientId = packet.clientId;
+        ws.role = packet.role;
+        chatClients.set(packet.clientId, ws);
+        console.log(`Registered WS client: ${packet.clientId} (${packet.role})`);
+        deliverPendingMessages(packet.clientId);
+      } else if (packet.type === 'message') {
+        const msg = packet.message;
+        msg.status = 'sent';
+        
+        store.addMessage(msg);
+        syncMessageToNotion(msg);
+        
+        const recipientId = msg.sender === 'User' ? msg.vendorId : 'user-client';
+        const recipientWs = chatClients.get(recipientId);
+        
+        if (recipientWs && recipientWs.readyState === 1) {
+          msg.status = 'delivered';
+          store.updateMessageStatus(msg.id, 'delivered');
+          recipientWs.send(JSON.stringify({ type: 'message', message: msg }));
+          syncMessageToNotion(msg);
+        }
+        
+        ws.send(JSON.stringify({ type: 'status-update', msgId: msg.id, status: msg.status }));
+      } else if (packet.type === 'read-receipt') {
+        const { vendorId, senderRole } = packet;
+        const threadMsgs = store.listMessages(vendorId);
+        threadMsgs.forEach(m => {
+          if (m.sender !== senderRole && m.status !== 'read') {
+            m.status = 'read';
+            store.updateMessageStatus(m.id, 'read');
+            
+            const senderId = m.sender === 'User' ? 'user-client' : m.vendorId;
+            const senderWs = chatClients.get(senderId);
+            if (senderWs && senderWs.readyState === 1) {
+              senderWs.send(JSON.stringify({ type: 'status-update', msgId: m.id, status: 'read' }));
+            }
+          }
+        });
+        syncReadStatusToNotion(vendorId, senderRole);
+      }
+    } catch (err) {
+      console.error('WS message processing error:', err.message);
+    }
+  });
+
+  ws.on('close', () => {
+    if (ws.clientId) {
+      console.log(`🔌 WS Connection closed: ${ws.clientId}`);
+      chatClients.delete(ws.clientId);
+    }
+  });
+  
+  ws.on('error', (err) => {
+    console.error('WS socket error:', err.message);
+  });
 });

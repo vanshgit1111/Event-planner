@@ -98,6 +98,32 @@ export default function App() {
     return () => clearTimeout(t);
   }, [refreshData]);
 
+  // Auto-fetch live vendors from /api/vendors?location=<city> after AI plan generation
+  useEffect(() => {
+    if (aiResults && eventData?.location) {
+      const fetchLiveVendors = async () => {
+        try {
+          const res = await fetch(`/api/vendors?location=${encodeURIComponent(eventData.location)}`);
+          const data = await res.json();
+          if (data.vendors && data.vendors.length > 0) {
+            setVendors(prev => {
+              const merged = [...prev];
+              for (const lv of data.vendors) {
+                if (!merged.some(v => v.id === lv.id || (v.organization === lv.organization && v.category === lv.category))) {
+                  merged.push(lv);
+                }
+              }
+              return merged;
+            });
+          }
+        } catch (e) {
+          console.warn("Failed to fetch live vendors:", e.message);
+        }
+      };
+      fetchLiveVendors();
+    }
+  }, [aiResults, eventData?.location]);
+
   useEffect(() => {
     if (role === "User" && !userTabs.find(t => t.id === activeTab)) setActiveTab("create");
     if (role === "Vendor" && !vendorTabs.find(t => t.id === activeTab)) setActiveTab("dashboard");
@@ -235,6 +261,7 @@ export default function App() {
             setVendors={setVendors}
             bookings={bookings}
             setBookings={setBookings}
+            refreshData={refreshData}
           />
         )}
         {activeTab === "timeline" && <Timeline eventData={eventData} aiResults={aiResults} />}

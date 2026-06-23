@@ -153,3 +153,12 @@ export function clearMessages(vendorId) {
   cache.messages = cache.messages.filter(m => m.vendorId !== vendorId);
   persist();
 }
+
+export function updateMessageStatus(id, status) {
+  const msg = cache.messages.find(m => m.id === id);
+  if (msg) {
+    msg.status = status;
+    persist();
+  }
+  return msg;
+}

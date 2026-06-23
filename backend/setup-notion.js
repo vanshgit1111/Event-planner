@@ -8,7 +8,7 @@
  * 4) Run: node backend/setup-notion.js YOUR_PAGE_ID
  */
 
-import { readFileSync, writeFileSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, copyFileSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -16,6 +16,16 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // Load .env
 const envPath = resolve(__dirname, '../.env');
+const envExamplePath = resolve(__dirname, '../.env.example');
+
+if (!existsSync(envPath) && existsSync(envExamplePath)) {
+  copyFileSync(envExamplePath, envPath);
+  console.log('📝 Created .env from .env.example');
+} else if (!existsSync(envPath)) {
+  writeFileSync(envPath, 'GEMINI_API_KEY=\nNOTION_TOKEN=\nNOTION_DB_EVENTS=\nNOTION_DB_VENDORS=\nNOTION_DB_BOOKINGS=\nNOTION_DB_FEEDBACK=\nNOTION_DB_CHAT_LOGS=\nGOOGLE_PLACES_API_KEY=\nGEOAPIFY_API_KEY=\n');
+  console.log('📝 Created empty .env file');
+}
+
 const envContent = readFileSync(envPath, 'utf-8');
 let NOTION_TOKEN = '';
 for (const line of envContent.split('\n')) {
@@ -60,15 +70,16 @@ async function main() {
 
   // 1. Events DB
   const eventsId = await createDatabase('📅 Events', {
-    'Name':        { title: {} },
-    'Type':        { rich_text: {} },
-    'Date':        { date: {} },
-    'Guests':      { number: {} },
-    'Location':    { rich_text: {} },
-    'Budget Min':  { number: {} },
-    'Budget Max':  { number: {} },
-    'Description': { rich_text: {} },
-    'Created At':  { date: {} },
+    'Name':           { title: {} },
+    'Type':           { rich_text: {} },
+    'Date':           { date: {} },
+    'Guests':         { number: {} },
+    'Location':       { rich_text: {} },
+    'Budget Min':     { number: {} },
+    'Budget Max':     { number: {} },
+    'Description':    { rich_text: {} },
+    'Generated Plan': { rich_text: {} },
+    'Created At':     { date: {} },
   });
   console.log(`✅ Events DB:   ${eventsId}`);
 
@@ -125,6 +136,26 @@ async function main() {
   });
   console.log(`✅ Feedback DB: ${feedbackId}`);
 
+  // 5. Chat Logs DB
+  const chatLogsId = await createDatabase('💬 Chat Logs', {
+    'Message ID':  { title: {} },
+    'Sender':      { select: { options: [
+      { name: 'User', color: 'blue' },
+      { name: 'Vendor', color: 'green' },
+      { name: 'AI', color: 'purple' },
+    ]}},
+    'Vendor Name': { rich_text: {} },
+    'Event Name':  { rich_text: {} },
+    'Message':     { rich_text: {} },
+    'Status':      { select: { options: [
+      { name: 'Sent', color: 'gray' },
+      { name: 'Delivered', color: 'blue' },
+      { name: 'Read', color: 'green' },
+    ]}},
+    'Timestamp':   { date: {} },
+  });
+  console.log(`✅ Chat Logs DB: ${chatLogsId}`);
+
   // Write IDs to .env
   let updatedEnv = envContent;
   const toAdd = [
@@ -132,6 +163,7 @@ async function main() {
     ['NOTION_DB_VENDORS',  vendorsId.replace(/-/g, '')],
     ['NOTION_DB_BOOKINGS', bookingsId.replace(/-/g, '')],
     ['NOTION_DB_FEEDBACK', feedbackId.replace(/-/g, '')],
+    ['NOTION_DB_CHAT_LOGS',chatLogsId.replace(/-/g, '')],
   ];
   for (const [key, val] of toAdd) {
     if (updatedEnv.includes(key)) {

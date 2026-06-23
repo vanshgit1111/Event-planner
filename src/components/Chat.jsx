@@ -9,8 +9,109 @@ export default function Chat({ role, messages, setMessages, vendors, eventData }
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
 
+  const wsRef = useRef(null);
+  const [wsStatus, setWsStatus] = useState("connecting");
+  const reconnectDelayRef = useRef(1000);
+
   const me = role === "Vendor" ? "Vendor" : "User";
   const vendorSelfId = "my-vendor-id";
+
+  // WebSocket Connection Hook
+  useEffect(() => {
+    let active = true;
+
+    function connect() {
+      if (!active) return;
+
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const host = window.location.host;
+      const wsUrl = `${protocol}//${host}/api/chat-ws`;
+
+      console.log(`Connecting to WebSocket: ${wsUrl}`);
+      const socket = new WebSocket(wsUrl);
+      wsRef.current = socket;
+
+      socket.onopen = () => {
+        if (!active) return;
+        setWsStatus("open");
+        reconnectDelayRef.current = 1000;
+
+        const clientId = role === "Vendor" ? vendorSelfId : "user-client";
+        socket.send(JSON.stringify({
+          type: "register",
+          clientId,
+          role
+        }));
+
+        if (activeChat && !activeChat.isAI) {
+          socket.send(JSON.stringify({
+            type: "read-receipt",
+            vendorId: activeChat.id,
+            senderRole: role
+          }));
+        }
+      };
+
+      socket.onmessage = (event) => {
+        if (!active) return;
+        try {
+          const packet = JSON.parse(event.data);
+          if (packet.type === "message") {
+            const receivedMsg = packet.message;
+            setMessages(prev => {
+              if (prev.some(m => m.id === receivedMsg.id)) return prev;
+              return [...prev, receivedMsg];
+            });
+
+            if (activeChat && activeChat.id === receivedMsg.vendorId) {
+              socket.send(JSON.stringify({
+                type: "read-receipt",
+                vendorId: activeChat.id,
+                senderRole: role
+              }));
+            }
+          } else if (packet.type === "status-update") {
+            const { msgId, status } = packet;
+            setMessages(prev => prev.map(m => m.id === msgId ? { ...m, status } : m));
+          }
+        } catch (err) {
+          console.error("Failed to parse WS packet:", err);
+        }
+      };
+
+      socket.onclose = () => {
+        if (!active) return;
+        setWsStatus("closed");
+        console.log(`WebSocket closed. Reconnecting in ${reconnectDelayRef.current}ms...`);
+        setTimeout(connect, reconnectDelayRef.current);
+        reconnectDelayRef.current = Math.min(reconnectDelayRef.current * 2, 15000);
+      };
+
+      socket.onerror = (err) => {
+        console.error("WebSocket error:", err);
+        socket.close();
+      };
+    }
+
+    connect();
+
+    return () => {
+      active = false;
+      if (wsRef.current) wsRef.current.close();
+    };
+  }, [role, activeChat]);
+
+  // Handle read receipt trigger on chat open
+  useEffect(() => {
+    if (wsRef.current && wsRef.current.readyState === 1 && activeChat && !activeChat.isAI) {
+      wsRef.current.send(JSON.stringify({
+        type: "read-receipt",
+        vendorId: activeChat.id,
+        senderRole: role
+      }));
+    }
+  }, [activeChat]);
+
   const vendorSelfProfile = (vendors || []).find((v) => v.id === vendorSelfId);
   const vendorInboxContacts =
     role === "Vendor" && messages.some((m) => m.vendorId === vendorSelfId)
@@ -75,16 +176,35 @@ export default function Chat({ role, messages, setMessages, vendors, eventData }
       sender: me,
       text: msg.trim(),
       timestamp: new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" }),
+      status: "sent"
     };
 
     const updatedMessages = [...messages, userMsg];
-    setMessages(updatedMessages);
     setMsg("");
 
-    // Peer-to-peer vendor/user message: store it in the shared local thread.
+    // Peer-to-peer vendor/user message: send via WebSocket
     if (!activeChat.isAI) {
+      if (wsRef.current && wsRef.current.readyState === 1) {
+        setMessages(updatedMessages);
+        wsRef.current.send(JSON.stringify({
+          type: "message",
+          message: userMsg
+        }));
+      } else {
+        setError("Reconnecting to chat server... Please wait.");
+        // Try fallback save via POST request
+        try {
+          const saved = await api.addMessage(userMsg);
+          setMessages([...messages, saved]);
+        } catch (err) {
+          console.error("Local backup send failed:", err);
+          setError("Chat connection offline. Message could not be sent.");
+        }
+      }
       return;
     }
+
+    setMessages(updatedMessages);
 
     // AI reply — call Gemini via backend
     setIsTyping(true);
@@ -383,13 +503,26 @@ export default function Chat({ role, messages, setMessages, vendors, eventData }
                         </div>
                         <div
                           style={{
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "flex-end",
+                            gap: "4px",
                             fontSize: "10px",
                             color: m.role === "user" ? "rgba(255,255,255,0.6)" : "var(--text3)",
-                            textAlign: "right",
                             marginTop: "4px",
                           }}
                         >
-                          {m.timestamp}
+                          <span>{m.timestamp}</span>
+                          {m.sender === me && (
+                            <span style={{ 
+                              fontSize: "11px", 
+                              color: m.status === "read" ? "var(--teal)" : "rgba(255,255,255,0.5)",
+                              marginLeft: "2px",
+                              lineHeight: 1
+                            }}>
+                              {m.status === "read" ? "✓✓" : m.status === "delivered" ? "✓✓" : "✓"}
+                            </span>
+                          )}
                         </div>
                       </div>
                     </div>

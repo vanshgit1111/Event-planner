@@ -1,9 +1,9 @@
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import { api } from "../api";
 
 const COLORS = ["var(--accent2)", "var(--teal)", "var(--gold)", "var(--coral)", "#a78bfa", "#34d399"];
 
-export default function VendorBudget({ eventData, aiResults, expenses, setExpenses, vendors, setVendors, bookings, setBookings }) {
+export default function VendorBudget({ eventData, aiResults, expenses, setExpenses, vendors, setVendors, bookings, setBookings, refreshData }) {
   const [expForm, setExpForm] = useState({ category: "", description: "", amount: "" });
   const [search, setSearch] = useState("");
   const [filterCat, setFilterCat] = useState("All Categories");
@@ -11,6 +11,152 @@ export default function VendorBudget({ eventData, aiResults, expenses, setExpens
   const [filterMaxBudget, setFilterMaxBudget] = useState("");
   const [compareList, setCompareList] = useState([]);
   const [isTagging, setIsTagging] = useState(false);
+  const [syncingId, setSyncingId] = useState(null);
+
+  const mapInstanceRef = useRef(null);
+  const markersRef = useRef([]);
+
+  // Declare filteredVendors early so useEffect hooks below can safely reference it
+  const filteredVendors = (vendors || []).filter(v => {
+    const matchSearch = (v.organization || "").toLowerCase().includes(search.toLowerCase());
+    const matchCat = filterCat === "All Categories" || v.category === filterCat;
+    const matchLoc = !filterLocation || (v.location || "").toLowerCase().includes(filterLocation.toLowerCase());
+    const matchBudget = !filterMaxBudget || Number(v.priceMax || 0) <= Number(filterMaxBudget);
+    return matchSearch && matchCat && matchLoc && matchBudget;
+  });
+
+  const handleSyncVendor = async (vendor) => {
+    if (!aiResults) return alert("Please generate an AI plan first.");
+    if (!confirm(`Do you want to sync "${vendor.organization}" as your selected ${vendor.category} in your event plan?`)) {
+      return;
+    }
+    
+    setSyncingId(vendor.id);
+    const updatedVendors = aiResults.vendors.map(v => {
+      if (v.category.toLowerCase() === vendor.category.toLowerCase()) {
+        return {
+          ...v,
+          name: vendor.organization,
+          priceRange: vendor.priceMin && vendor.priceMax ? `₹${Number(vendor.priceMin).toLocaleString()} - ₹${Number(vendor.priceMax).toLocaleString()}` : (vendor.priceRange || "Request quote"),
+          rating: vendor.rating,
+          notes: vendor.address || vendor.location,
+          isSynced: true,
+          realVendorId: vendor.id
+        };
+      }
+      return v;
+    });
+
+    const updatedAiResults = {
+      ...aiResults,
+      vendors: updatedVendors
+    };
+
+    try {
+      await api.saveAiResults(updatedAiResults);
+      if (eventData) {
+        await fetch("/api/notion/save-vendor", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            organization: vendor.organization,
+            category: vendor.category,
+            location: vendor.location || eventData.location,
+            priceMin: vendor.priceMin,
+            priceMax: vendor.priceMax,
+            services: vendor.services || "",
+            contact: vendor.contact || "",
+            rating: vendor.rating
+          })
+        }).catch(e => console.warn("Notion vendor save failed:", e.message));
+      }
+      alert(`Synced "${vendor.organization}" to plan!`);
+      if (refreshData) await refreshData();
+    } catch (err) {
+      console.error(err);
+      alert("Failed to sync vendor to plan.");
+    } finally {
+      setSyncingId(null);
+    }
+  };
+
+  // Bind the global sync handler so that Leaflet popups can call it
+  useEffect(() => {
+    window.syncVendorToPlan = (vendorId) => {
+      const vendor = filteredVendors.find(v => v.id === vendorId);
+      if (vendor) {
+        handleSyncVendor(vendor);
+      }
+    };
+    return () => {
+      delete window.syncVendorToPlan;
+    };
+  }, [filteredVendors, aiResults]);
+
+  // Ref-callback: initializes Leaflet the moment the map container div mounts
+  // (avoids "Map container not found" when the div is conditionally rendered)
+  const mapContainerRef = useRef(null);
+  const initMap = (node) => {
+    if (!node || !window.L) return;
+    if (mapInstanceRef.current) {
+      // Already initialized – just invalidate size in case container was hidden
+      mapInstanceRef.current.invalidateSize();
+      return;
+    }
+    const defaultCenter = [19.0760, 72.8777]; // Mumbai
+    const map = window.L.map(node, { zoomControl: true }).setView(defaultCenter, 11);
+    window.L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
+      subdomains: 'abcd',
+      maxZoom: 20
+    }).addTo(map);
+    mapInstanceRef.current = map;
+    mapContainerRef.current = node;
+  };
+
+  // Map Markers Synchronization – runs whenever filteredVendors changes
+  useEffect(() => {
+    const map = mapInstanceRef.current;
+    if (!map || !window.L) return;
+
+    // Clear existing markers
+    markersRef.current.forEach(marker => marker.remove());
+    markersRef.current = [];
+
+    const bounds = [];
+    filteredVendors.forEach((v) => {
+      if (v.lat && v.lon && Number.isFinite(Number(v.lat)) && Number.isFinite(Number(v.lon))) {
+        const latLng = [Number(v.lat), Number(v.lon)];
+        bounds.push(latLng);
+
+        const popupHtml = `
+          <div style="color: #fff; font-family: system-ui; min-width: 170px; padding: 4px; line-height: 1.4;">
+            <div style="font-weight:600; font-size:13px; margin-bottom:2px; color: #fff;">${v.organization}</div>
+            <div style="font-size:10px; text-transform:uppercase; color:#9f85ff; font-weight:600; margin-bottom:4px;">${v.category}</div>
+            <div style="font-size:12px; color:#2dd4bf; font-weight:600; margin-bottom:6px;">${v.priceMin && v.priceMax ? `₹${Number(v.priceMin).toLocaleString()} - ₹${Number(v.priceMax).toLocaleString()}` : (v.priceRange || 'Request quote')}</div>
+            <div style="font-size:11px; color:#bbb; margin-bottom:8px; max-height: 40px; overflow: hidden;">${v.address || v.location}</div>
+            <div style="display:flex; gap:6px;">
+              <button onclick="window.syncVendorToPlan('${v.id}')" style="background:#9f85ff; border:none; color:#fff; padding:4px 8px; border-radius:4px; font-size:10px; cursor:pointer; font-weight:500; transition: background 0.2s;">Sync with Plan</button>
+              ${v.mapUrl ? `<a href="${v.mapUrl}" target="_blank" style="background:#334155; color:#fff; text-decoration:none; padding:4px 8px; border-radius:4px; font-size:10px; font-weight:500;">Nav</a>` : ''}
+            </div>
+          </div>
+        `;
+
+        const marker = window.L.marker(latLng)
+          .addTo(map)
+          .bindPopup(popupHtml);
+
+        markersRef.current.push(marker);
+      }
+    });
+
+    if (bounds.length > 0) {
+      map.fitBounds(bounds, { padding: [50, 50], maxZoom: 14 });
+    }
+
+    // Ensure Leaflet knows the container size after React re-renders
+    setTimeout(() => map.invalidateSize(), 100);
+  }, [filteredVendors]);
 
   const requestBooking = async (vendor) => {
     if (!eventData) return alert("Please create an event first.");
@@ -59,13 +205,7 @@ export default function VendorBudget({ eventData, aiResults, expenses, setExpens
     }
   };
 
-  const filteredVendors = (vendors || []).filter(v => {
-    const matchSearch = (v.organization || "").toLowerCase().includes(search.toLowerCase());
-    const matchCat = filterCat === "All Categories" || v.category === filterCat;
-    const matchLoc = !filterLocation || (v.location || "").toLowerCase().includes(filterLocation.toLowerCase());
-    const matchBudget = !filterMaxBudget || Number(v.priceMax || 0) <= Number(filterMaxBudget);
-    return matchSearch && matchCat && matchLoc && matchBudget;
-  });
+  // filteredVendors is declared above (before useEffect hooks) to avoid temporal dead zone
 
   const toggleCompare = (v) => {
     if (compareList.find(c => c.id === v.id)) {
@@ -268,35 +408,62 @@ export default function VendorBudget({ eventData, aiResults, expenses, setExpens
           </button>
         </div>
 
-        <div className="grid-3" style={{ gap: "1rem" }}>
-          {filteredVendors.length === 0 ? (
-            <div className="card" style={{ gridColumn: "1 / -1", borderStyle: "dashed", textAlign: "center", padding: "2rem" }}>
-              <div style={{ color: "var(--text3)", fontSize: "13px" }}>No vendors listed yet. Vendors can register via the Vendor role.</div>
-            </div>
-          ) : filteredVendors.map((v, i) => {
-            const isComparing = compareList.find(c => c.id === v.id);
-            const status = bookings?.find(b => b.vendorId === v.id)?.status;
-            return (
-              <div key={v.id} className="card" style={{ padding: "1rem", borderLeft: `3px solid ${COLORS[i % COLORS.length]}` }}>
-                <div className="flex justify-between items-center mb-1">
-                  <span style={{ fontSize: "12px", fontFamily: "DM Mono", color: "var(--text3)", textTransform: "uppercase" }}>{v.category}</span>
-                  <span style={{ fontSize: "12px", color: "var(--gold)" }}>{"★".repeat(Math.round(v.rating))} {v.rating}</span>
-                </div>
-                <div style={{ fontSize: "15px", fontWeight: 500, color: "var(--text)", marginBottom: "4px" }}>{v.organization}</div>
-                <div style={{ fontSize: "13px", color: "var(--teal)", marginBottom: "4px" }}>₹{v.priceMin} - ₹{v.priceMax}</div>
-                {v.aiTag && <div style={{ marginBottom: "8px" }}><span className="badge badge-accent" style={{ fontSize: "10px" }}>AI: {v.aiTag}</span></div>}
-                <div className="flex gap-2 mt-2">
-                  <button className="btn btn-primary btn-sm" style={{ flex: 1 }} onClick={() => requestBooking(v)} disabled={!!status}>
-                    {status ? status : "Book"}
-                  </button>
-                  <label style={{ display: "flex", alignItems: "center", gap: "4px", fontSize: "12px", cursor: "pointer", color: "var(--text2)" }}>
-                    <input type="checkbox" checked={!!isComparing} onChange={() => toggleCompare(v)} />
-                    Compare
-                  </label>
-                </div>
+        <div style={{ display: "grid", gridTemplateColumns: filteredVendors.length > 0 ? "1fr 400px" : "1fr", gap: "1.5rem", alignItems: "start" }}>
+          <div className="grid-2" style={{ gap: "1rem" }}>
+            {filteredVendors.length === 0 ? (
+              <div className="card" style={{ gridColumn: "1 / -1", borderStyle: "dashed", textAlign: "center", padding: "2rem" }}>
+                <div style={{ color: "var(--text3)", fontSize: "13px" }}>No vendors listed yet. Vendors can register via the Vendor role.</div>
               </div>
-            );
-          })}
+            ) : filteredVendors.map((v, i) => {
+              const isComparing = compareList.find(c => c.id === v.id);
+              const status = bookings?.find(b => b.vendorId === v.id)?.status;
+              return (
+                <div key={v.id} className="card" style={{ padding: "1rem", borderLeft: `3px solid ${COLORS[i % COLORS.length]}` }}>
+                  <div className="flex justify-between items-center mb-1">
+                    <span style={{ fontSize: "12px", fontFamily: "DM Mono", color: "var(--text3)", textTransform: "uppercase" }}>{v.category}</span>
+                    <span style={{ fontSize: "12px", color: "var(--gold)" }}>{"★".repeat(Math.round(v.rating))} {v.rating}</span>
+                  </div>
+                  <div style={{ fontSize: "15px", fontWeight: 500, color: "var(--text)", marginBottom: "4px" }}>{v.organization}</div>
+                  <div style={{ fontSize: "13px", color: "var(--teal)", marginBottom: "4px" }}>
+                    {v.priceMin && v.priceMax ? `₹${Number(v.priceMin).toLocaleString()} - ₹${Number(v.priceMax).toLocaleString()}` : (v.priceRange || "Request quote")}
+                  </div>
+                  {v.aiTag && <div style={{ marginBottom: "8px" }}><span className="badge badge-accent" style={{ fontSize: "10px" }}>AI: {v.aiTag}</span></div>}
+                  <div className="flex gap-2 mt-2" style={{ flexWrap: "wrap", alignItems: "center" }}>
+                    <button className="btn btn-primary btn-sm" style={{ flex: 1, minWidth: "60px" }} onClick={() => requestBooking(v)} disabled={!!status}>
+                      {status ? status : "Book"}
+                    </button>
+                    <button className="btn btn-outline btn-sm" style={{ flex: 1, minWidth: "60px" }} onClick={() => handleSyncVendor(v)} disabled={syncingId === v.id}>
+                      {syncingId === v.id ? "..." : "Sync"}
+                    </button>
+                    <label style={{ display: "flex", alignItems: "center", gap: "4px", fontSize: "12px", cursor: "pointer", color: "var(--text2)", marginLeft: "4px" }}>
+                      <input type="checkbox" checked={!!isComparing} onChange={() => toggleCompare(v)} />
+                      Compare
+                    </label>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          {filteredVendors.length > 0 && (
+            <div className="card" style={{ padding: "0.5rem", position: "sticky", top: "1rem", zIndex: 10 }}>
+              <div style={{ fontSize: "12px", fontFamily: "DM Mono", color: "var(--text3)", textTransform: "uppercase", padding: "0.5rem", borderBottom: "1px solid var(--border)", marginBottom: "0.5rem" }}>
+                Interactive map
+              </div>
+              {/* ref callback: Leaflet inits exactly when this div enters the DOM */}
+              <div
+                ref={(node) => {
+                  if (node && !mapInstanceRef.current) {
+                    initMap(node);
+                  } else if (!node && mapInstanceRef.current) {
+                    // Div is unmounting – destroy map to allow re-init next time
+                    mapInstanceRef.current.remove();
+                    mapInstanceRef.current = null;
+                  }
+                }}
+                style={{ height: "450px", borderRadius: "8px", background: "var(--bg3)", overflow: "hidden" }}
+              />
+            </div>
+          )}
         </div>
       </div>
 
@@ -311,7 +478,9 @@ export default function VendorBudget({ eventData, aiResults, expenses, setExpens
               <div key={v.id} style={{ background: "rgba(255,255,255,0.03)", padding: "1rem", borderRadius: "8px" }}>
                 <div style={{ fontWeight: 500 }}>{v.organization}</div>
                 <div style={{ fontSize: "13px", color: "var(--text2)", margin: "4px 0" }}>Category: {v.category}</div>
-                <div style={{ fontSize: "13px", color: "var(--teal)", margin: "4px 0" }}>Price: ₹{v.priceMin} - ₹{v.priceMax}</div>
+                <div style={{ fontSize: "13px", color: "var(--teal)", margin: "4px 0" }}>
+                  Price: {v.priceMin && v.priceMax ? `₹${Number(v.priceMin).toLocaleString()} - ₹${Number(v.priceMax).toLocaleString()}` : (v.priceRange || "Request quote")}
+                </div>
                 <div style={{ fontSize: "13px", color: "var(--gold)", margin: "4px 0" }}>Rating: {v.rating}★</div>
                 <div style={{ fontSize: "12px", color: "var(--text3)", margin: "4px 0" }}>Services: {v.services || "N/A"}</div>
               </div>
